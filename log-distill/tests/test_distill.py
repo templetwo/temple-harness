@@ -487,3 +487,38 @@ class TestZstd(DistillCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RedactionTests(unittest.TestCase):
+    """The mask at the funnel: credential-shaped strings never leave this tool.
+
+    Two directions, per the house's experimental law 2: the gate fires, AND the
+    gate is load-bearing (emptying the patterns must let the probe through,
+    proving detection is the patterns' work and not an accident elsewhere).
+    """
+
+    PROBE = "please use sk-testfakekey0123456789abcdef for the call"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module()
+
+    def test_redaction_fires_at_the_funnel(self):
+        out = self.mod._clip(self.PROBE, 0)
+        self.assertNotIn("sk-testfakekey", out)
+        self.assertIn(self.mod._REDACT_MARKER, out)
+
+    def test_redaction_survives_clipping(self):
+        # A cap that lands inside the masked span must not resurrect key bytes.
+        out = self.mod._clip(self.PROBE, 30)
+        self.assertNotIn("sk-testfakekey", out)
+
+    def test_redaction_is_load_bearing(self):
+        original = self.mod._REDACT_PATTERNS[:]
+        try:
+            self.mod._REDACT_PATTERNS.clear()
+            leaked = self.mod._clip(self.PROBE, 0)
+            self.assertIn("sk-testfakekey", leaked)  # gate CAN fail => it is real
+        finally:
+            self.mod._REDACT_PATTERNS[:] = original
+        self.assertNotIn("sk-testfakekey", self.mod._clip(self.PROBE, 0))

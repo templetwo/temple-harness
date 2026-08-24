@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -184,9 +185,35 @@ def read_log_bytes(path: str) -> bytes:
 # --------------------------------------------------------------------------
 
 
+# Credential-shaped strings are masked before ANY text leaves this tool.
+# The host logs this reader distills are exactly where pasted keys end up
+# (a real key sat in a real session transcript for six days before a
+# receipted dive found it, 2026-08-24). Distilled output is built to travel
+# — chronicles, reports, chats — so the mask is applied at the single funnel
+# every emitted string passes through, and the marker states what happened
+# without carrying a byte of the secret. High-precision patterns only; a
+# false mask costs a few readable characters, a false pass costs a rotation.
+_REDACT_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"xai-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"),
+]
+_REDACT_MARKER = "[REDACTED:key-shaped]"
+
+
+def _redact(text: str) -> str:
+    """Mask credential-shaped substrings, stating so in place."""
+    for pat in _REDACT_PATTERNS:
+        text = pat.sub(_REDACT_MARKER, text)
+    return text
+
+
 def _clip(text: str, cap: int) -> str:
-    """Cap text and SAY SO — the marker is appended, never itself cut."""
-    text = " ".join(str(text or "").split())
+    """Redact, then cap and SAY SO — the marker is appended, never itself cut."""
+    text = _redact(" ".join(str(text or "").split()))
     if cap <= 0 or len(text) <= cap:
         return text
     return text[:cap] + f" [+{len(text) - cap} chars]"
