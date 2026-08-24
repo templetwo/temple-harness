@@ -646,7 +646,15 @@ def main(argv=None) -> int:
         parsed = parse_session(read_log_bytes(file_path))
         anomaly_flags = detect_anomalies(parsed)
         renderer = {"text": render_text, "json": render_json, "receipts": render_receipts}[mode]
-        sys.stdout.write(renderer(parsed, anomaly_flags, file_path, note, tail, max_text) + "\n")
+        # THE single funnel, for real this time. The first redaction pass sat at
+        # _clip and was called "the single funnel every emitted string passes
+        # through" — it was not: anomaly details and the --json end_error dict
+        # reached stdout raw (found by outside review, Kimi, 2026-08-24, with a
+        # synthetic Bearer probe in all three modes). Every rendered byte now
+        # passes through _redact HERE, at the last line before it leaves the
+        # process, so no present or future field can route around the mask.
+        # _clip keeps its earlier redact as depth, not as the guarantee.
+        sys.stdout.write(_redact(renderer(parsed, anomaly_flags, file_path, note, tail, max_text)) + "\n")
         return 0
     except DistillError as exc:
         sys.stderr.write(f"{TOOL_NAME}: {exc}\n")

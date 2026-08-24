@@ -522,3 +522,54 @@ class RedactionTests(unittest.TestCase):
         finally:
             self.mod._REDACT_PATTERNS[:] = original
         self.assertNotIn("sk-testfakekey", self.mod._clip(self.PROBE, 0))
+
+
+class OutputFunnelRedactionTests(unittest.TestCase):
+    """The TRUE single funnel: every rendered byte passes _redact before stdout.
+
+    Exists because the first redaction pass (at _clip) was called the single
+    funnel and was not — anomaly details and the --json end_error dict reached
+    output raw (outside review, Kimi, 2026-08-24; reproduced in-house with a
+    Bearer probe). Renderers are NOT the guarantee; the emission funnel is.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module()
+        cls.parsed = {
+            "session": {"id": "probe", "cwd": "/x"}, "events": 1,
+            "unparseable": 0, "unknown_types": {},
+            "turns": [{
+                "turn": 1, "start_time": None, "end_time": None,
+                "user_text": "hi", "assistant_text": "",
+                "assistant_reasoning_chars": 0, "tool_calls": [],
+                "end_reason": "turn/error", "end_reasons": ["turn/error"],
+                "finish_kinds": [],
+                "end_error": {"code": "E", "message": "Bearer abcdefghijklmnopqrstu999SECRET"},
+                "input_tokens_sum": None, "input_tokens_final": None,
+                "output_tokens": 0, "resumed": False,
+            }],
+        }
+
+    def _emit(self, renderer):
+        flags = self.mod.detect_anomalies(self.parsed)
+        return self.mod._redact(renderer(self.parsed, flags, "probe", None, None, 0))
+
+    def test_anomaly_paths_masked_in_text_mode(self):
+        out = self._emit(self.mod.render_text)
+        self.assertNotIn("SECRET", out)
+        self.assertIn(self.mod._REDACT_MARKER, out)
+
+    def test_end_error_dict_masked_in_json_mode(self):
+        out = self._emit(self.mod.render_json)
+        self.assertNotIn("SECRET", out)
+        self.assertIn(self.mod._REDACT_MARKER, out)
+
+    def test_funnel_is_load_bearing(self):
+        original = self.mod._REDACT_PATTERNS[:]
+        try:
+            self.mod._REDACT_PATTERNS.clear()
+            self.assertIn("SECRET", self._emit(self.mod.render_json))
+        finally:
+            self.mod._REDACT_PATTERNS[:] = original
+        self.assertNotIn("SECRET", self._emit(self.mod.render_json))
