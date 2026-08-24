@@ -28,7 +28,19 @@ in any year, can check any load-bearing statement without trusting its author.
    say plainly when a claim rests on the house's own word rather than an
    independently checkable surface.
 
+7. **Never write into `evidence/` or any frozen or hash-manifested directory.**
+   Those hold primary records only. A synthesis you author is an authored note:
+   it goes in your own workspace, names you as its author, and never wears the
+   word "receipts" in its title. Earned 2026-08-24: a model's chronicle summary,
+   planted in a repo's evidence directory under the name "Chronicle Receipts",
+   would have read as primary record to the next stranger.
+8. **A receipt names its instrument — and one instrument.** Citing source A for
+   a claim that came from source B is misattribution even when both sources are
+   real and both support the conclusion. Merged lanes get merged wrongly.
+
 ## The tell
 
 If a statement matters and you cannot point to its receipt, you do not have a
-finding yet. You have a candidate.
+finding yet. You have a candidate. And if you are about to save a summary
+somewhere official-looking, stop: whose directory is that, and will a stranger
+mistake your synthesis for the record?
