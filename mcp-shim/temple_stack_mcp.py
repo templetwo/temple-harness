@@ -9,10 +9,10 @@ without ever handing them the write lane.
 Design constraints, all deliberate:
 
   * STDLIB ONLY. Runs anywhere python3 exists. No pip, no venv, no wheels.
-  * READ-ONLY BY CONSTRUCTION. Exactly three MCP tools, each pinned to one
+  * READ-ONLY BY CONSTRUCTION. Exactly four MCP tools, each pinned to one
     allowlisted bridge target (see BRIDGE_TARGETS / ALLOWED_BRIDGE_TOOLS).
     There is no pass-through tool. A caller cannot name a bridge tool; it can
-    only pick one of three doors that were opened for it.
+    only pick one of four doors that were opened for it.
   * FAIL CLOSED, SPEAK PLAINLY. An unreachable bridge produces a tool result
     that says so. A missing token stops the process at startup. Nothing here
     returns an empty success.
@@ -46,7 +46,7 @@ import urllib.request
 # --------------------------------------------------------------------------
 
 SERVER_NAME = "temple-stack"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 # MCP stdio transport is newline-delimited JSON-RPC 2.0 (NOT Content-Length
 # framed — that is LSP). Versions this shim knows how to speak, newest first.
@@ -89,6 +89,11 @@ LIMIT_MAX = 10
 
 BRIDGE_TARGETS = {
     "stack_recall": ("POST", "recall_insights"),
+    # stack_latest reuses the SAME allowlisted read target as stack_recall — no
+    # new bridge surface. It is the sanctioned recency door: a query-less tail
+    # read (order=newest, no search terms), which is a different question from
+    # the newest-ordered *search* that stack_recall deliberately pins away.
+    "stack_latest": ("POST", "recall_insights"),
     "stack_open_threads": ("POST", "get_open_threads"),
     "stack_heartbeat": ("GET", "/api/heartbeat"),
 }
@@ -313,19 +318,8 @@ def _coverage_line(result: dict) -> str:
     return " | ".join(parts)
 
 
-def render_recall(result: dict, query: str, domain: str | None, limit: int) -> str:
-    items = result.get("items") or []
-    header = [
-        f'Sovereign Stack recall — query: "{query}"'
-        + (f' | domain: "{domain}"' if domain else " | domain: (all)")
-        + f" | limit: {limit} | order: relevance",
-        _coverage_line(result),
-    ]
-    if not items:
-        header.append("")
-        header.append("No matching chronicle entries.")
-        return "\n".join(header)
-
+def _insight_blocks(items: list) -> list:
+    """Render chronicle insight entries as numbered blocks (shared by recall/latest)."""
     blocks = []
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
@@ -344,7 +338,37 @@ def render_recall(result: dict, query: str, domain: str | None, limit: int) -> s
         if item.get("claim_id"):
             meta.append(f"claim: {item['claim_id']}")
         blocks.append(f"[{index}] " + " · ".join(meta) + "\n" + str(item.get("content") or "").strip())
-    return "\n".join(header) + "\n\n" + "\n\n".join(blocks)
+    return blocks
+
+
+def render_recall(result: dict, query: str, domain: str | None, limit: int) -> str:
+    items = result.get("items") or []
+    header = [
+        f'Sovereign Stack recall — query: "{query}"'
+        + (f' | domain: "{domain}"' if domain else " | domain: (all)")
+        + f" | limit: {limit} | order: relevance",
+        _coverage_line(result),
+    ]
+    if not items:
+        header.append("")
+        header.append("No matching chronicle entries.")
+        return "\n".join(header)
+    return "\n".join(header) + "\n\n" + "\n\n".join(_insight_blocks(items))
+
+
+def render_latest(result: dict, domain: str | None, limit: int) -> str:
+    items = result.get("items") or []
+    header = [
+        f"Sovereign Stack latest — the {limit} newest chronicle entries"
+        + (f' | domain: "{domain}"' if domain else " | domain: (all)")
+        + " | order: newest",
+        _coverage_line(result),
+    ]
+    if not items:
+        header.append("")
+        header.append("No chronicle entries.")
+        return "\n".join(header)
+    return "\n".join(header) + "\n\n" + "\n\n".join(_insight_blocks(items))
 
 
 def render_open_threads(result: dict, limit: int) -> str:
@@ -386,7 +410,7 @@ def render_heartbeat(data: dict) -> str:
         if data.get(key) is not None:
             lines.append(f"{label}: {data[key]}")
     lines.append(f"bridge_url: {bridge_url()}")
-    lines.append("scope: READ-ONLY (recall, open threads, heartbeat)")
+    lines.append("scope: READ-ONLY (recall, latest, open threads, heartbeat)")
     return "\n".join(lines)
 
 
@@ -414,6 +438,26 @@ TOOL_DEFINITIONS = [
                 "limit": {"type": "integer", "minimum": 1, "maximum": LIMIT_MAX, "default": LIMIT_DEFAULT, "description": f"Entries to return, 1-{LIMIT_MAX}. Default {LIMIT_DEFAULT}."},
             },
             "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "stack_latest",
+        "title": "Newest chronicle entries",
+        "description": (
+            "List the NEWEST entries in the Sovereign Stack chronicle, most recent "
+            "first. Use this ONLY for what-happened-recently questions ('what's the "
+            "latest?', 'what happened today?'). It takes NO query — for any topical "
+            "or historical question, use stack_recall instead. Read-only. Coverage "
+            "is stated in every result."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Optional domain filter. Matching is subset-based, so a compound domain is reachable by any one component."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": LIMIT_MAX, "default": LIMIT_DEFAULT, "description": f"Entries to return, 1-{LIMIT_MAX}. Default {LIMIT_DEFAULT}."},
+            },
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -463,6 +507,26 @@ def call_tool(name: str, arguments: dict) -> str:
             forwarded["domain"] = domain
         result = bridge_call("recall_insights", forwarded)
         return render_recall(result, query.strip(), domain, limit)
+
+    if name == "stack_latest":
+        # The groove-guard, enforced server-side and not just in the schema: a
+        # query here means the caller wanted stack_recall — say so, plainly.
+        if "query" in arguments:
+            raise ValueError(
+                "stack_latest takes no 'query' — it returns the newest entries only. "
+                "For a topical search, use stack_recall."
+            )
+        domain = arguments.get("domain")
+        domain = domain.strip() if isinstance(domain, str) and domain.strip() else None
+        limit = _clamp_limit(arguments.get("limit"))
+        # order is pinned to newest and is NOT in the input schema; this door has
+        # no search terms, so newest-first here is a tail read, not the
+        # recency-noise trap stack_recall pins away.
+        forwarded = {"limit": limit, "order": "newest"}
+        if domain:
+            forwarded["domain"] = domain
+        result = bridge_call("recall_insights", forwarded)
+        return render_latest(result, domain, limit)
 
     if name == "stack_open_threads":
         limit = _clamp_limit(arguments.get("limit"))
@@ -519,10 +583,12 @@ def handle_message(message: dict) -> dict | None:
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             "instructions": (
                 "Read-only access to the Temple of Two's Sovereign Stack chronicle. "
-                "stack_recall searches insights (relevance-ordered), stack_open_threads "
-                "lists unresolved questions, stack_heartbeat checks the bridge. There is "
-                "no write tool and no pass-through: this shim cannot record anything. "
-                "Every result states its coverage — read the coverage line, not just the hits."
+                "stack_recall searches insights (relevance-ordered), stack_latest lists "
+                "the newest entries (no query — recency questions only), "
+                "stack_open_threads lists unresolved questions, stack_heartbeat checks "
+                "the bridge. There is no write tool and no pass-through: this shim "
+                "cannot record anything. Every result states its coverage — read the "
+                "coverage line, not just the hits."
             ),
         }
         return _result(request_id, payload)

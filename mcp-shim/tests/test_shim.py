@@ -343,12 +343,12 @@ class TestToolsList(ShimTestCase):
         proc.handshake()
         return proc.request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
 
-    def test_exactly_three_tools(self):
+    def test_exactly_four_tools(self):
         tools = self._tools()
-        self.assertEqual(len(tools), 3)
+        self.assertEqual(len(tools), 4)
         self.assertEqual(
             {tool["name"] for tool in tools},
-            {"stack_recall", "stack_open_threads", "stack_heartbeat"},
+            {"stack_recall", "stack_latest", "stack_open_threads", "stack_heartbeat"},
         )
 
     def test_schemas(self):
@@ -363,6 +363,17 @@ class TestToolsList(ShimTestCase):
         self.assertEqual(recall["properties"]["limit"]["default"], 5)
         # order must NOT be exposed: relevance is pinned, not negotiable.
         self.assertNotIn("order", recall["properties"])
+
+        latest = by_name["stack_latest"]["inputSchema"]
+        self.assertEqual(latest["type"], "object")
+        self.assertEqual(latest["required"], [])
+        self.assertFalse(latest["additionalProperties"])
+        # query must NOT exist on this door: recency reads carry no search terms.
+        self.assertEqual(set(latest["properties"]), {"domain", "limit"})
+        self.assertNotIn("query", latest["properties"])
+        self.assertNotIn("order", latest["properties"])
+        self.assertEqual(latest["properties"]["limit"]["maximum"], 10)
+        self.assertEqual(latest["properties"]["limit"]["default"], 5)
 
         threads = by_name["stack_open_threads"]["inputSchema"]
         self.assertEqual(threads["required"], [])
@@ -443,6 +454,61 @@ class TestToolCalls(ShimTestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertEqual(STATE.calls, [])
 
+    def test_latest_forwards_order_newest_and_no_query(self):
+        proc = self.spawn()
+        proc.handshake()
+        response = self.call(proc, "stack_latest", {})
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(len(STATE.calls), 1)
+        body = STATE.calls[0]
+        self.assertEqual(body["tool"], "recall_insights")
+        self.assertEqual(body["arguments"]["order"], "newest")
+        self.assertEqual(body["arguments"]["limit"], 5)
+        # A tail read carries no search terms — ever.
+        self.assertNotIn("query", body["arguments"])
+        self.assertNotIn("domain", body["arguments"])
+
+    def test_latest_order_cannot_be_overridden_by_the_caller(self):
+        proc = self.spawn()
+        proc.handshake()
+        self.call(proc, "stack_latest", {"order": "relevance"})
+        self.assertEqual(STATE.calls[0]["arguments"]["order"], "newest")
+
+    def test_latest_refuses_a_query_and_redirects_to_recall(self):
+        # The groove-guard: a query here means the caller wanted stack_recall.
+        proc = self.spawn()
+        proc.handshake()
+        response = self.call(proc, "stack_latest", {"query": "num_ctx"})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("stack_recall", self.text_of(response))
+        # Refused before any bridge work, same as every other boundary here.
+        self.assertEqual(STATE.calls, [])
+
+    def test_latest_forwards_domain_and_clamps_limit(self):
+        proc = self.spawn()
+        proc.handshake()
+        self.call(proc, "stack_latest", {"domain": "sovereign-data", "limit": 99})
+        arguments = STATE.calls[0]["arguments"]
+        self.assertEqual(arguments["domain"], "sovereign-data")
+        self.assertEqual(arguments["limit"], 10)
+
+    def test_latest_renders_header_and_bridge_coverage(self):
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_latest", {}))
+        self.assertIn("Sovereign Stack latest", text)
+        self.assertIn("order: newest", text)
+        self.assertIn("A chronicle entry body.", text)
+        self.assertIn("returned 1 of 786 matched", text)
+
+    def test_latest_empty_chronicle_says_so(self):
+        STATE.result_payload = default_recall_result(items=[], total=0)
+        proc = self.spawn()
+        proc.handshake()
+        response = self.call(proc, "stack_latest", {})
+        self.assertFalse(response["result"]["isError"])
+        self.assertIn("No chronicle entries.", self.text_of(response))
+
     def test_open_threads_forwards_and_renders(self):
         STATE.result_payload = default_threads_result()
         proc = self.spawn()
@@ -514,9 +580,11 @@ class TestReadOnlyBoundary(unittest.TestCase):
     """These test the internal functions directly — no server, no network."""
 
     def test_allowlist_contains_only_the_two_read_tools(self):
+        # stack_latest reuses recall_insights: four doors, still only two POST
+        # targets and one GET path. The allowlist itself must not have grown.
         self.assertEqual(shim.ALLOWED_BRIDGE_TOOLS, frozenset({"recall_insights", "get_open_threads"}))
         self.assertEqual(shim.ALLOWED_BRIDGE_PATHS, frozenset({"/api/heartbeat"}))
-        self.assertEqual(len(shim.BRIDGE_TARGETS), 3)
+        self.assertEqual(len(shim.BRIDGE_TARGETS), 4)
 
     def test_bridge_call_refuses_non_allowlisted_tools(self):
         for forbidden in (
