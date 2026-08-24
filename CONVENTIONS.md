@@ -83,3 +83,17 @@ distillation, config inspection — and ride the current harness for the rest.
 opinion concurring.)
 
 Enforced by the standing test at review time.
+
+## 7. Nothing log-derived travels unredacted
+
+Host session logs are where pasted keys end up, and distilled output is
+built to travel — into chronicles, reports, and chats. Every string
+log-distill emits passes through one funnel (`_clip`), and that funnel masks
+credential-shaped content before anything leaves (`_redact`, with the marker
+stated in place of the bytes). The same standard the t2fathom card layer
+already held: the audit layer must never become the exfiltration layer.
+
+Enforced: `RedactionTests` in the log-distill suite — redaction fires at the
+funnel, survives clipping, and is proven load-bearing (empty the patterns
+and a probe leaks, so the gate is real, not incidental). (HQ amendment,
+2026-08-24, from a live incident on the Studio.)
