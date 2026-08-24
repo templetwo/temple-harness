@@ -46,7 +46,7 @@ import urllib.request
 # --------------------------------------------------------------------------
 
 SERVER_NAME = "temple-stack"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 # MCP stdio transport is newline-delimited JSON-RPC 2.0 (NOT Content-Length
 # framed — that is LSP). Versions this shim knows how to speak, newest first.
@@ -673,6 +673,40 @@ def serve(stdin=None, stdout=None) -> int:
             _write(stdout, response)
 
 
+def dump_config() -> str:
+    """The resolved configuration, legibly, without serving and without secrets.
+
+    Inspection must not require credentials: a missing token is REPORTED, not
+    fatal here — this surface exists so a human (or a 9B) can see exactly what
+    would run before anything runs. The token VALUE never appears; only its
+    presence and where it came from.
+    """
+    env_file = os.environ.get("TEMPLE_BRIDGE_ENV_FILE") or DEFAULT_ENV_FILE
+    if os.environ.get("TEMPLE_BRIDGE_TOKEN"):
+        token_status = "present (TEMPLE_BRIDGE_TOKEN override)"
+    elif load_token():
+        token_status = f"present ({TOKEN_ENV_KEY} in {env_file})"
+    else:
+        token_status = f"ABSENT (set TEMPLE_BRIDGE_TOKEN or {TOKEN_ENV_KEY} in {env_file})"
+    lines = [
+        f"{SERVER_NAME} {SERVER_VERSION} — resolved configuration (no network, no serving)",
+        f"protocol versions: {', '.join(SUPPORTED_PROTOCOL_VERSIONS)} (preferred {PREFERRED_PROTOCOL_VERSION})",
+        f"bridge_url: {bridge_url()}",
+        f"token: {token_status}",
+        f"timeout_s: {bridge_timeout()}",
+        f"max_chars per result: {max_chars()}",
+        f"limit: default {LIMIT_DEFAULT}, max {LIMIT_MAX}",
+        "doors (MCP tool -> bridge target):",
+    ]
+    for name in sorted(BRIDGE_TARGETS):
+        method, target = BRIDGE_TARGETS[name]
+        lines.append(f"  {name} -> {method} {target}")
+    lines.append(f"allowlisted POST tools: {', '.join(sorted(ALLOWED_BRIDGE_TOOLS))}")
+    lines.append(f"allowlisted GET paths: {', '.join(sorted(ALLOWED_BRIDGE_PATHS))}")
+    lines.append("write lane: none (read-only by construction; widening requires a reviewed diff)")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     if argv and argv[0] in ("-h", "--help"):
@@ -680,6 +714,9 @@ def main(argv=None) -> int:
         return 0
     if argv and argv[0] == "--version":
         sys.stderr.write(f"{SERVER_NAME} {SERVER_VERSION}\n")
+        return 0
+    if argv and argv[0] == "--dump-config":
+        sys.stdout.write(dump_config() + "\n")
         return 0
 
     # Fail closed at startup: no token, no server. One line, stderr, no value.

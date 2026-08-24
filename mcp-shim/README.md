@@ -77,6 +77,14 @@ argument — only by a code change.
 - **Unknown JSON-RPC method** → error `-32601`. **Malformed JSON** → `-32700`.
   **Notifications** get no response. The transport survives all of them.
 
+## Inspecting the resolved configuration
+
+`temple_stack_mcp.py --dump-config` prints exactly what would run — bridge
+URL, timeout, caps, every door and its bridge target, both allowlists — and
+exits without serving or touching the network. It works with **no token**
+(inspection must not require credentials) and reports token **presence and
+source only**; the value never prints, and a test fails if it ever does.
+
 ## Configuration
 
 All optional except the token.

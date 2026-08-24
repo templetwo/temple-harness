@@ -14,6 +14,18 @@ that gives dsh-driven local models read access to the Sovereign Stack chronicle.
 - `mcp-shim/` — a thin local MCP (stdio) server wrapping the Sovereign Stack's
   REST bridge, read-only scope, so any local model running under dsh gains
   chronicle recall. Personalization through shared memory, not changed weights.
+  `--dump-config` prints the fully resolved configuration (doors, allowlists,
+  token presence — never the value) without serving.
+- `log-distill/` — a single-file reader for dsh's append-only session event
+  logs (JSONL/zstd). Distills a session into a legible summary with anomaly
+  flags for the failure modes this house has diagnosed by hand
+  (reasoning-only-stop, turn-error, tool-error, finish-length), plus `--json`
+  and a chronicle-ready `--receipts` mode. We own the audit layer, not the
+  loop: this READS the host harness's record, it never writes one.
+- `CONVENTIONS.md` — the written laws of this repo (coverage always stated,
+  fail closed with redirect, boundary-is-a-diff, legible to a 9B, stdlib
+  only). Where a law is testable, `test_conventions.py` and the log-distill
+  suite go red when it breaks.
 
 ## Boundaries
 
