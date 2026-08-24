@@ -173,3 +173,42 @@ fail-open being caught; and the no-token startup exit.
 Each of these gates was **verified able to fail**: mutating the source to break
 the pinned order, widen the allowlist, disable truncation, or drop the fail-open
 check each turns the suite red, and the pristine file turns it green again.
+
+
+---
+
+## v0.2.0 — stack_latest, the sanctioned recency door (2026-08-24)
+
+A fourth read-only tool, proposed by the MacBook seat from live use (a 9B model asked
+"recall the most recent" and had no door), reviewed and landed by HQ. `stack_latest`
+is a query-less tail read: `order=newest` pinned outside the schema, no search terms
+anywhere, and a server-side groove-guard that refuses any `query` with an explicit
+redirect to `stack_recall`. The recency-noise trap the relevance pin exists for is
+newest-ordered *search*; with no query there is no match set, so the trap cannot
+re-enter. Zero new bridge surface: it reuses the allowlisted `recall_insights`
+target, and a test asserts the allowlist is still exactly two POST names + one GET path.
+
+## dsh registration — CONFIRMED stanza (MacBook, 2026-08-24)
+
+dsh has **no `mcpServers` JSON**. Registration is a cordis patch row in
+`$DSH_HOME/profiles/<name>/cordis.patch.yml`, and a NEW entry must be wrapped in the
+patch grammar's `insert:` key (a bare row is treated as an id-targeted override and
+rejected). Working stanza, verified by `--dump-config` and live run:
+
+```yaml
+- insert:
+    - id: mcp-temple-stack
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: temple-stack
+        transport: stdio
+        command: /opt/homebrew/bin/python3
+        args: ['<path-to>/temple-harness/mcp-shim/temple_stack_mcp.py']
+        env:
+          TEMPLE_BRIDGE_URL: https://stack.templetwo.com   # any seat that is not HQ; the 127.0.0.1:8100 default exists only on the Studio
+          TEMPLE_MCP_MAX_CHARS: '2500'
+```
+
+Python note: verified on 3.14.x (both seats); syntax floor 3.10; pin a real python3
+(the MacBook's PATH python3 is a conda 3.10 — the shim compiles there but the
+verified runs are 3.14).
