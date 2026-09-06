@@ -231,6 +231,35 @@ class TestAnomalies(DistillCase):
         code, out, _err = self.run_main([path])
         self.assertIn("[tool-call-unanswered] turn 1", out)
 
+    def test_two_idless_call_result_pairs_match_in_order(self):
+        """None == None must not let the second result overwrite the first call.
+
+        Two id-less tool/call events plus two id-less tool/result events used
+        to attach both results to the first call (second flagged unanswered).
+        """
+        events = [
+            ev_session(), ev_turn_start(1),
+            ev_tool_call(1, name="alpha"),
+            ev_tool_call(1, name="beta"),
+            ev_tool_result(1, text="A"),
+            ev_tool_result(1, text="BBBBBBBBBB"),
+            ev_turn_end(1),
+        ]
+        events[2]["data"]["callId"] = None
+        events[3]["data"]["callId"] = None
+        events[4]["data"]["message"]["content"][0]["toolCallId"] = None
+        events[5]["data"]["message"]["content"][0]["toolCallId"] = None
+        parsed = distill.parse_session(
+            ("\n".join(json.dumps(e) for e in events) + "\n").encode()
+        )
+        calls = parsed["turns"][0]["tool_calls"]
+        self.assertEqual(calls[0]["name"], "alpha")
+        self.assertEqual(calls[0]["result_chars"], 1)
+        self.assertEqual(calls[1]["name"], "beta")
+        self.assertEqual(calls[1]["result_chars"], 10)
+        flags = distill.detect_anomalies(parsed)
+        self.assertFalse(any(f["flag"] == "tool-call-unanswered" for f in flags))
+
     def test_finish_length_is_flagged(self):
         events = [ev_session(), ev_turn_start(1), ev_finish(1, "length"),
                   ev_assistant(1, text="partial"), ev_turn_end(1)]
@@ -300,6 +329,26 @@ class TestInputResolution(DistillCase):
         code, out, _err = self.run_main([os.path.join(self.dir.name, "root"), "--list"])
         self.assertEqual(code, 0)
         self.assertIn("coverage: 1 sessions listed", out)
+
+    def test_list_mode_redacts_key_shaped_directory_names(self):
+        secret = "sk-" + "A" * 24
+        session_dir = os.path.join(self.dir.name, f"{secret}_session")
+        os.makedirs(session_dir)
+        with open(os.path.join(session_dir, "session.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(ev_session()) + "\n")
+        code, out, _err = self.run_main([self.dir.name, "--list"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(secret, out)
+        self.assertIn(distill._REDACT_MARKER, out)
+        self.assertIn("coverage: 1 sessions listed", out)
+
+    def test_distill_error_stderr_is_redacted(self):
+        secret = "sk-" + "B" * 24
+        missing = os.path.join(self.dir.name, f"{secret}_missing.jsonl")
+        code, _out, err = self.run_main([missing])
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, err)
+        self.assertIn(distill._REDACT_MARKER, err)
 
     def test_unknown_flag_fails_closed(self):
         path = self.write_session([ev_session()] + good_turn())
@@ -572,4 +621,23 @@ class OutputFunnelRedactionTests(unittest.TestCase):
             self.assertIn("SECRET", self._emit(self.mod.render_json))
         finally:
             self.mod._REDACT_PATTERNS[:] = original
-        self.assertNotIn("SECRET", self._emit(self.mod.render_json))
+
+
+class NeighboringKeyShapeTests(unittest.TestCase):
+    """Patterns added so neighboring-tool keys do not travel. Synthetic only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module()
+
+    def test_github_pat_slack_and_google_shapes_are_masked(self):
+        probes = {
+            "github_pat_" + "x" * 22: "github_pat_",
+            "xoxb-" + "y" * 12: "xoxb-",
+            "AIza" + "z" * 35: "AIza",
+        }
+        for secret, prefix in probes.items():
+            with self.subTest(prefix=prefix):
+                out = self.mod._redact(f"see {secret} please")
+                self.assertNotIn(secret, out)
+                self.assertIn(self.mod._REDACT_MARKER, out)

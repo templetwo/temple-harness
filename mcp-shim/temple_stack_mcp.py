@@ -46,7 +46,7 @@ import urllib.request
 # --------------------------------------------------------------------------
 
 SERVER_NAME = "temple-stack"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 
 # MCP stdio transport is newline-delimited JSON-RPC 2.0 (NOT Content-Length
 # framed — that is LSP). Versions this shim knows how to speak, newest first.
@@ -179,6 +179,27 @@ def load_token() -> str | None:
 # --------------------------------------------------------------------------
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Fail closed on 3xx.
+
+    urllib.request.urlopen follows redirects and copies Authorization onto the
+    next request. Anything that can answer on the bridge port can 302 the token
+    off-box. The bridge has no legitimate redirect; refuse it as a transport
+    error rather than strip-and-follow.
+    """
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        location = headers.get("Location") or "(no Location)"
+        raise BridgeError(
+            f"bridge attempted a redirect ({code}) to {location} — refusing to follow"
+        )
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+_BRIDGE_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
 def _http_json(method: str, url: str, *, body=None, token=None, timeout=None):
     """One HTTP round trip returning parsed JSON, or raise BridgeError."""
     data = None
@@ -191,7 +212,7 @@ def _http_json(method: str, url: str, *, body=None, token=None, timeout=None):
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout or bridge_timeout()) as response:
+        with _BRIDGE_OPENER.open(request, timeout=timeout or bridge_timeout()) as response:
             raw = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:  # subclass of URLError — must come first
         detail = ""

@@ -54,7 +54,7 @@ import subprocess
 import sys
 
 TOOL_NAME = "log-distill"
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.1.1"
 
 DEFAULT_MAX_TEXT = 200
 
@@ -191,12 +191,18 @@ def read_log_bytes(path: str) -> bytes:
 # receipted dive found it, 2026-08-24). Distilled output is built to travel
 # — chronicles, reports, chats — so the mask is applied at the single funnel
 # every emitted string passes through, and the marker states what happened
-# without carrying a byte of the secret. High-precision patterns only; a
-# false mask costs a few readable characters, a false pass costs a rotation.
+# without carrying a byte of the secret. High-precision shapes only. Floor,
+# stated honestly: whitespace-splayed, base64-wrapped, and homoglyph secrets
+# are out of scope. Neighboring-tool key shapes (fine-grained GitHub PAT,
+# Slack, Google) sit here even if this house has not yet seen them in a log.
+# A false mask costs a few readable characters, a false pass costs a rotation.
 _REDACT_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"xai-[A-Za-z0-9_-]{16,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"),
@@ -353,7 +359,15 @@ def parse_session(raw: bytes) -> dict:
                         if isinstance(inner, dict) and inner.get("type") == "text":
                             result_chars += len(str(inner.get("text") or ""))
             for call in turn["tool_calls"]:
-                if call["callId"] == call_id or (call_id is None and call["result_chars"] is None):
+                # None == None is True, so `call["callId"] == call_id` alone
+                # matches the first id-less call on every id-less result and
+                # overwrites it. Require an actual id to id-match; fall back
+                # to "first unanswered" only when the result itself is id-less.
+                matched = (
+                    (call_id is not None and call["callId"] == call_id)
+                    or (call_id is None and call["result_chars"] is None)
+                )
+                if matched:
                     call["result_chars"] = result_chars
                     call["is_error"] = is_error
                     break
@@ -635,29 +649,33 @@ def main(argv=None) -> int:
         if listing:
             found = find_session_files(path) if os.path.isdir(path) else []
             if not found:
-                sys.stderr.write(f"{TOOL_NAME}: no sessions found under {path}\n")
+                sys.stderr.write(_redact(f"{TOOL_NAME}: no sessions found under {path}\n"))
                 return 1
+            # --list used to write raw paths and skip the funnel (a session
+            # directory named sk-…_session leaked). Same _redact as renderers.
             for session_path in found:
-                sys.stdout.write(session_path + "\n")
-            sys.stdout.write(f"coverage: {len(found)} sessions listed | source: {path}\n")
+                sys.stdout.write(_redact(session_path + "\n"))
+            sys.stdout.write(_redact(f"coverage: {len(found)} sessions listed | source: {path}\n"))
             return 0
 
         file_path, note = resolve_input(path)
         parsed = parse_session(read_log_bytes(file_path))
         anomaly_flags = detect_anomalies(parsed)
         renderer = {"text": render_text, "json": render_json, "receipts": render_receipts}[mode]
-        # THE single funnel, for real this time. The first redaction pass sat at
+        # THE single funnel for rendered modes. The first redaction pass sat at
         # _clip and was called "the single funnel every emitted string passes
         # through" — it was not: anomaly details and the --json end_error dict
         # reached stdout raw (found by outside review, Kimi, 2026-08-24, with a
-        # synthetic Bearer probe in all three modes). Every rendered byte now
-        # passes through _redact HERE, at the last line before it leaves the
-        # process, so no present or future field can route around the mask.
-        # _clip keeps its earlier redact as depth, not as the guarantee.
+        # synthetic Bearer probe in all three modes). Text/json/receipts bytes
+        # pass through _redact HERE. --list paths and DistillError stderr are
+        # separate emission doors and are also passed through _redact, above
+        # and below; they are in scope of law 7 even though they are not this
+        # renderer line. _clip keeps its earlier redact as depth, not as the
+        # guarantee.
         sys.stdout.write(_redact(renderer(parsed, anomaly_flags, file_path, note, tail, max_text)) + "\n")
         return 0
     except DistillError as exc:
-        sys.stderr.write(f"{TOOL_NAME}: {exc}\n")
+        sys.stderr.write(_redact(f"{TOOL_NAME}: {exc}\n"))
         return 1
 
 
