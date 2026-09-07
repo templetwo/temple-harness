@@ -1442,6 +1442,22 @@ class TestNewDoors(ShimTestCase):
         self.assertNotIn("unacked total 0", text)
         self.assertIn("guardian: oldest_unacked unmeasured", text)
 
+    def test_signals_renders_a_scalar_per_source_count_as_measured(self):
+        """The mirror of the zero: a real count must not print as 'unmeasured'.
+
+        summary mode returns a per-source object today, but the heartbeat carries
+        the same field as flat ints, and a renderer that answers 'unmeasured' to a
+        measured 317 is lying in the other direction.
+        """
+        payload = default_signals_summary()
+        payload["by_source"] = {"honk": 317, "guardian": None}
+        STATE.payload_by_tool = {"signals_summary": payload}
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_signals"))
+        self.assertIn("honk: open 317", text)
+        self.assertIn("guardian: open unmeasured", text)
+
     def test_signals_partial_read_shows_counts_and_an_error_line(self):
         # ok:true WITH an error is a partial read: real rows, something else
         # unmeasured. It is neither all-clear nor a failed call.

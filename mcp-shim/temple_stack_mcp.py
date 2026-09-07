@@ -828,11 +828,17 @@ def render_signals(result: dict) -> str:
     lines.append("by_source:")
     for name in sorted(by_source):
         facts = by_source[name]
-        if not isinstance(facts, dict):
-            lines.append(f"  {name}: unmeasured")
+        if isinstance(facts, dict):
+            rendered = " · ".join(f"{key} {_measured(facts[key])}" for key in sorted(facts))
+            lines.append(f"  {name}: {rendered or 'unmeasured'}")
             continue
-        rendered = " · ".join(f"{key} {_measured(facts[key])}" for key in sorted(facts))
-        lines.append(f"  {name}: {rendered or 'unmeasured'}")
+        # A SCALAR IS A MEASUREMENT, AND CALLING IT UNMEASURED IS THE MIRROR OF
+        # THE ZERO THIS RENDERER EXISTS TO AVOID. summary mode returns a per-source
+        # OBJECT, but the same field is a flat int per source on the heartbeat
+        # ({"honk": 317, ...}); reporting a real 317 as "unmeasured" would be the
+        # same lie pointed the other way, so the scalar goes through _measured and
+        # only None becomes the word.
+        lines.append(f"  {name}: open {_measured(facts)}")
     return "\n".join(lines)
 
 
