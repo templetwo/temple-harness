@@ -190,6 +190,10 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
     def http_error_302(self, req, fp, code, msg, headers):
         location = headers.get("Location") or "(no Location)"
+        try:
+            fp.close()
+        except Exception:  # noqa: BLE001 - close is best-effort before we refuse
+            pass
         raise BridgeError(
             f"bridge attempted a redirect ({code}) to {location} — refusing to follow"
         )

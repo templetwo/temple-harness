@@ -192,10 +192,13 @@ def read_log_bytes(path: str) -> bytes:
 # — chronicles, reports, chats — so the mask is applied at the single funnel
 # every emitted string passes through, and the marker states what happened
 # without carrying a byte of the secret. High-precision shapes only. Floor,
-# stated honestly: whitespace-splayed, base64-wrapped, and homoglyph secrets
-# are out of scope. Neighboring-tool key shapes (fine-grained GitHub PAT,
-# Slack, Google) sit here even if this house has not yet seen them in a log.
-# A false mask costs a few readable characters, a false pass costs a rotation.
+# stated honestly: whitespace-splayed, base64-wrapped, homoglyph secrets, and
+# bare UUIDs/hex blobs are out of scope. A house bridge token that is not
+# vendor-shaped (no sk-/gh-/Bearer prefix) will pass. Do not add a hex
+# catch-all — chronicle claim_ids and session ids would go dark.
+# Neighboring-tool key shapes (fine-grained GitHub PAT, Slack, Google) sit
+# here even if this house has not yet seen them in a log. A false mask costs
+# a few readable characters, a false pass costs a rotation.
 _REDACT_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
     re.compile(r"xai-[A-Za-z0-9_-]{16,}"),

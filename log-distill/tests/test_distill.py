@@ -621,6 +621,7 @@ class OutputFunnelRedactionTests(unittest.TestCase):
             self.assertIn("SECRET", self._emit(self.mod.render_json))
         finally:
             self.mod._REDACT_PATTERNS[:] = original
+        self.assertNotIn("SECRET", self._emit(self.mod.render_json))
 
 
 class NeighboringKeyShapeTests(unittest.TestCase):
@@ -641,3 +642,16 @@ class NeighboringKeyShapeTests(unittest.TestCase):
                 out = self.mod._redact(f"see {secret} please")
                 self.assertNotIn(secret, out)
                 self.assertIn(self.mod._REDACT_MARKER, out)
+
+    def test_bare_uuid_and_hex_are_out_of_scope(self):
+        """House tokens that are UUID/hex do not match. Catch-all would mask claim_ids."""
+        uuid = "550e8400-e29b-41d4-a716-446655440000"
+        hex64 = "a" * 64
+        self.assertIn(uuid, self.mod._redact(f"token {uuid}"))
+        self.assertIn(hex64, self.mod._redact(f"token {hex64}"))
+
+    def test_bearer_prefix_masks_a_house_shaped_token(self):
+        token = "h" * 24
+        out = self.mod._redact(f"Authorization: Bearer {token}")
+        self.assertNotIn(token, out)
+        self.assertIn(self.mod._REDACT_MARKER, out)
