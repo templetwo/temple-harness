@@ -774,5 +774,62 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("returned 0", shim._coverage_line({}))
 
 
+class TestRedirects(unittest.TestCase):
+    """A 302 must not copy Authorization onto the next hop (P0, live-probed)."""
+
+    def test_http_json_refuses_redirect_and_does_not_forward_authorization(self):
+        leaked = []
+
+        class Sink(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                leaked.append(self.headers.get("Authorization"))
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        class Bounce(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            sink_url = ""
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", self.sink_url)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        sink = ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        bounce = ThreadingHTTPServer(("127.0.0.1", 0), Bounce)
+        Bounce.sink_url = f"http://127.0.0.1:{sink.server_address[1]}/sink"
+        threading.Thread(target=sink.serve_forever, daemon=True).start()
+        threading.Thread(target=bounce.serve_forever, daemon=True).start()
+        token = "redirect-probe-token-123456"
+        try:
+            with self.assertRaises(shim.BridgeError) as ctx:
+                shim._http_json(
+                    "GET",
+                    f"http://127.0.0.1:{bounce.server_address[1]}/start",
+                    token=token,
+                    timeout=2,
+                )
+            self.assertIn("redirect", str(ctx.exception).lower())
+            self.assertEqual(leaked, [])
+        finally:
+            bounce.shutdown()
+            sink.shutdown()
+            bounce.server_close()
+            sink.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
