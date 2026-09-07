@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.4.0 — stack readiness (PR: feat/stack-readiness-2026-09-06)
+
+Built against the Sovereign Stack as deployed 2026-09-06 (52 published tools, 48
+retired; none of this shim's doors among them).
+
+### mcp-shim 0.4.0
+
+**Credential path — TIER TWO (law 8), Anthony's tap.**
+
+- Two transports, chosen by configuration and never by guessing. **Seat socket:**
+  `SOVEREIGN_SEAT` (or `TEMPLE_BRIDGE_SOCKET`) sends `X-Sovereign-Seat` over
+  HTTP/1.1 on `AF_UNIX` with **no `Authorization` header** — the bridge routes any
+  Authorization header to the bearer check, so sending both would silently stop
+  being a seat. **Scoped grant:** `TEMPLE_BRIDGE_TOKEN` only.
+- **The env-file fallback is REMOVED.** `parse_env_file`, `load_token`,
+  `DEFAULT_ENV_FILE` and `TOKEN_ENV_KEY` are deleted, not bypassed;
+  `TEMPLE_BRIDGE_ENV_FILE` is now a startup refusal naming both real doors.
+  Before this, `--dump-config` on a clean environment reported
+  `token: present (BRIDGE_TOKEN in ~/.config/sovereign-bridge.env)` — the shim's
+  default was the master key.
+- Configuring **both** transports, or **neither**, or a socket with no seat id, is
+  a refusal. `--dump-config` reports the transport and *why*, by variable name,
+  never a value, and exits 0 even when the answer is "none".
+- The 3xx refusal now covers **both** transports.
+
+**Doors — TIER TWO (law 8): the allowlist widens by exactly three read names.**
+
+- `ALLOWED_BRIDGE_TOOLS` gains `arrive_lineage`, `current_policies`,
+  `signals_summary`. Five POST targets, seven doors, one GET path. Still no write
+  lane and still no pass-through.
+- `stack_arrive` → `arrive_lineage`, `full_content: true`, `limit_per_bucket`
+  clamped to 20, `source_instance` from `TEMPLE_SEAT_NAME` (a **bare model name**;
+  unset or decorated is refused with the reason). On the seat transport the bridge
+  OVERRIDES `source_instance` with the verified seat id, so the coverage line says
+  so: an empty `to_self` bucket there is a routing fact, not an empty mailbox.
+- `stack_policies` → `current_policies`, no filter, no `include_retired`.
+- `stack_signals` → `signals_summary` with `mode` pinned to `summary` **outside**
+  the schema. Renders `total`, `stale_24h`, `stale_7d`, `by_source`, `ingestion`
+  and any `error`. A null count renders `unmeasured`, never `0`. Inner `ok: false`
+  is a refusal; inner `ok: true` with an `error` is a **partial** read and renders
+  counts *and* the error line.
+- `stack_heartbeat` gains the `unacked_signals` total, on the same `unmeasured`
+  rule.
+
+**Result-type pin (law 3).** The bridge `json.loads` a tool's output and falls
+back to the raw string, so `arrive_lineage` and `current_policies` arrive as
+STRINGS. `TEXT_RESULT_TOOLS` names the prose doors; `json_result_tools()` derives
+the rest from `ALLOWED_BRIDGE_TOOLS` at call time, so the partition is total and
+disjoint by construction. Each helper refuses the other's type — a string where
+an object belongs is the bridge's fail-open costume, an object where text belongs
+is a changed tool shape.
+
+**ONE widening constant, and the canary is why.** The first draft of this branch
+carried `JSON_RESULT_TOOLS` as a second frozenset. That set stood in front of the
+allowlist, so widening `ALLOWED_BRIDGE_TOOLS` alone changed nothing — and
+`tests/test_canary.py::test_allowlist_is_the_write_refusal_gate` (PR #5, the
+MacBook seat) performs exactly that mutation and demands the call reach the
+network. Deriving the object-door set fixes the boundary rather than the test.
+Measured by hand: derived + widened allowlist raises `BridgeError` (reached the
+network, as the canary demands); re-frozen + widened allowlist still raises
+`BridgeToolNotAllowed` — the false green the canary exists to catch.
+
+**Canary plumbing, assertions untouched.** `test_canary.py` called
+`bridge_call(..., token=…, base_url=…)` and `_http_json("GET", url, token=…)`.
+Those parameters are deleted with the env-file credential path, so the canary now
+builds a `Transport` and passes `transport=`. Every assertion, every mutation and
+every restore is unchanged. Two canaries added for gates this release created:
+the text lane is gated by the same one constant, and the master-key env-file
+refusal stops firing when its variable name is pointed elsewhere.
+
+**Version.** 0.3.1 → 0.4.0, so the `User-Agent` becomes `temple-stack/0.4.0`. That
+string identifies harness traffic in bridge logs; a grep pinned to
+`temple-stack/0.3.1` goes blind on this release.
+
+### reconcile with main (PRs #5 and #6, MacBook seat, same night)
+
+- **PR #5's canary** (`mcp-shim/tests/test_canary.py`) drives the real gates now.
+  Its assertions, mutations and restores are untouched; only the way a call names
+  its destination changed, because `token=` / `base_url=` went out with the
+  env-file credential path. Two canaries added for gates this release created.
+- **PR #6's `test_readme_claims.py`** kept verbatim and extended with three
+  assertions DERIVED from the code — every door named in both READMEs, every
+  allowlisted POST target named in the boundary comment — so the docs cannot rot
+  the way a count does. The prose now lists the doors instead of counting them,
+  and the numeric test count is gone from the shim README for the same reason.
+
+### tests
+
+- 38 → 111 (including PR #5's 4 canaries and PR #6's claims tests, now 7). Two
+  fake bridges from one handler (TCP for the grant transport, a Unix socket for
+  the seat transport), so the two paths are not two fixtures that can drift
+  apart.
+- **`test_conventions.py::TestCoverageAlwaysStated` no longer iterates a
+  hand-written list of three doors** — that was a fail-open in the law-1 check
+  itself: a new door needed no coverage line to stay green. It now drives off
+  `TOOL_DEFINITIONS` and asserts its own table covers every door.
+- **Deleted assertions, named because law 8 says a removed check is invisible to
+  CI:** `test_env_file_parsing`, `test_missing_env_file_returns_empty_not_an_exception`,
+  `test_env_override_wins_over_the_file` (test_shim.py) and
+  `test_env_file_token_branch_reported_and_never_printed` (test_conventions.py).
+  All four asserted that loading the master key out of a shell-sourceable file
+  WORKED. They are replaced by `TestTransportResolution`, which asserts the
+  parser and its constants no longer exist at all.
+
 ## 0.3.1 / 0.1.1 — unreleased (PR #1)
 
 ### mcp-shim 0.3.1

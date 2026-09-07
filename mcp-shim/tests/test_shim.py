@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Tests for the Temple Stack MCP shim.
 
-Stdlib unittest only. These tests NEVER touch the real bridge and NEVER need the
-real token: a fake bridge is stood up on a random localhost port and the shim is
-pointed at it via TEMPLE_BRIDGE_URL, with TEMPLE_BRIDGE_TOKEN supplying a dummy
-credential so the startup gate passes.
+Stdlib unittest only. These tests NEVER touch the real bridge, NEVER need a real
+credential, and NEVER read the master key's env file — that file is refused by
+the shim now and the refusal has its own tests.
+
+TWO FAKE BRIDGES, ONE PER TRANSPORT, because the shim has two:
+  * TCP on a random localhost port, driven by TEMPLE_BRIDGE_URL +
+    TEMPLE_BRIDGE_TOKEN — the SCOPED GRANT transport.
+  * A Unix domain socket in a temp dir, driven by TEMPLE_BRIDGE_SOCKET +
+    SOVEREIGN_SEAT — the SEAT SOCKET transport. Same handler, so the two paths
+    are compared against one server behaviour rather than two fixtures.
 
 Run:  python3 -m unittest discover -s tests -v      (from mcp-shim/)
 """
@@ -14,6 +20,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -24,11 +33,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHIM_PATH = os.path.join(os.path.dirname(HERE), "temple_stack_mcp.py")
 
-# A dummy credential. The production path reads ~/.config/sovereign-bridge.env;
-# nothing in this suite reads or needs the real value.
+# A dummy SCOPED GRANT value. The master key is never involved: the shim refuses
+# to load it, and nothing in this suite reads or needs any real value.
 DUMMY_CREDENTIAL = "not-a-real-token"
-# A credential the fake bridge deliberately rejects, so the HTTP 401 path is exercised.
+# A value the fake bridge deliberately rejects, so the HTTP 401 path is exercised.
 REJECTED_CREDENTIAL = "rejected-by-the-fake-bridge"
+# The seat id the fake seat socket expects to see in X-Sovereign-Seat.
+DUMMY_SEAT = "test-seat-studio"
+# The BARE MODEL NAME stack_arrive announces itself with (TEMPLE_SEAT_NAME).
+DUMMY_SEAT_NAME = "test-model-9b"
+# A distinctive string the dump-config tests assert never reaches stdout/stderr.
+SENTINEL_VALUE = "sentinel-value-that-must-never-print"
+
+# Every environment variable the shim resolves a transport from. Popped before
+# every spawn so an ambient SOVEREIGN_SEAT in the developer's own terminal
+# cannot make the suite refuse for transport-ambiguity reasons.
+TRANSPORT_ENV_VARS = (
+    "TEMPLE_BRIDGE_TOKEN",
+    "TEMPLE_BRIDGE_SOCKET",
+    "TEMPLE_BRIDGE_ENV_FILE",
+    "SOVEREIGN_SEAT",
+    "TEMPLE_SEAT_NAME",
+    "TEMPLE_BRIDGE_URL",
+)
+
+
+def clean_env(**overrides):
+    """os.environ minus every transport variable, plus the ones asked for."""
+    env = dict(os.environ)
+    for name in TRANSPORT_ENV_VARS:
+        env.pop(name, None)
+    env.update({k: v for k, v in overrides.items() if v is not None})
+    return env
+
+
+def grant_transport(base_url, value=DUMMY_CREDENTIAL):
+    """A grant Transport for the direct-call tests, built without the environment."""
+    return shim.Transport("grant", "test fixture", token=value, base_url=base_url)
+
+
+def seat_transport(socket_path, seat=DUMMY_SEAT):
+    """A seat Transport for the direct-call tests, built without the environment."""
+    return shim.Transport("seat", "test fixture", socket_path=socket_path, seat=seat)
 
 
 def load_shim_module():
@@ -56,19 +102,30 @@ class FakeBridgeState:
 
     def __init__(self):
         self.calls = []           # every parsed POST /api/call body, in order
-        self.result_payload = None  # dict -> wrapped in {"ok":true,"result":...}
+        self.headers = []         # every request's headers, in order, as dicts
+        self.result_payload = None  # dict OR str -> wrapped in {"ok":true,"result":...}
+        # Per-bridge-tool payloads, so ONE fake can serve doors whose result
+        # types differ: recall returns an object, current_policies returns prose.
+        self.payload_by_tool = {}
         self.raw_response = None    # str -> returned verbatim (fail-open shapes)
         self.heartbeat = {
             "status": "ok",
             "version": "1.15.0-fake",
-            "tools": 97,
+            "tools": 52,
             "source_commit": "deadbee",
+            "unacked_signals": {"total": 3, "error": None, "ingestion": "fresh"},
         }
 
     def reset(self):
         self.calls.clear()
+        self.headers.clear()
         self.result_payload = None
+        self.payload_by_tool = {}
         self.raw_response = None
+
+    def header_of(self, name, index=-1):
+        """One header from a recorded request. None when it was not sent."""
+        return self.headers[index].get(name) if self.headers else None
 
 
 STATE = FakeBridgeState()
@@ -88,13 +145,18 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _record_headers(self):
+        STATE.headers.append({key: value for key, value in self.headers.items()})
+
     def do_GET(self):
+        self._record_headers()
         if self.path == "/api/heartbeat":
             self._send(200, json.dumps(STATE.heartbeat))
         else:
             self._send(404, json.dumps({"detail": "not found"}))
 
     def do_POST(self):
+        self._record_headers()
         if self.path != "/api/call":
             self._send(404, json.dumps({"detail": "not found"}))
             return
@@ -106,14 +168,30 @@ class FakeBridgeHandler(BaseHTTPRequestHandler):
             parsed = {"_unparseable": raw}
         STATE.calls.append(parsed)
 
-        authorization = self.headers.get("Authorization") or ""
-        if not authorization.startswith("Bearer ") or authorization.endswith(REJECTED_CREDENTIAL):
+        # THE SEAT PATH CARRIES NO CREDENTIAL, and this fake enforces that the
+        # same way the real bridge does: an Authorization header of any kind
+        # routes to the bearer check, and only a request with none at all may
+        # present a seat header. A shim that sent both would fail here.
+        authorization = self.headers.get("Authorization")
+        seat = self.headers.get("X-Sovereign-Seat")
+        if authorization is None and seat:
+            if seat != DUMMY_SEAT:
+                self._send(401, json.dumps({"detail": f"seat {seat} is not registered", "failure_class": "auth"}))
+                return
+        elif not (authorization or "").startswith("Bearer ") or (authorization or "").endswith(REJECTED_CREDENTIAL):
             self._send(401, json.dumps({"detail": "Missing or malformed Bearer token.", "failure_class": "auth"}))
             return
+
         if STATE.raw_response is not None:
             self._send(200, STATE.raw_response)
             return
-        payload = STATE.result_payload if STATE.result_payload is not None else default_recall_result()
+        tool = parsed.get("tool") if isinstance(parsed, dict) else None
+        if tool in STATE.payload_by_tool:
+            payload = STATE.payload_by_tool[tool]
+        elif STATE.result_payload is not None:
+            payload = STATE.result_payload
+        else:
+            payload = default_recall_result()
         self._send(200, json.dumps({"ok": True, "result": payload, "duration_ms": 1}))
 
 
@@ -163,24 +241,134 @@ def default_threads_result():
     }
 
 
+def default_signals_summary(total=3, stale_24h=1, stale_7d=0, error=None):
+    """What signals_summary(mode='summary') returns, in the stack's own shape.
+
+    Nulls are load-bearing here: the stack nulls a count it could not measure
+    rather than publishing a zero, and the renderer must carry that through.
+    """
+    return {
+        "ok": True,
+        "mode": "summary",
+        "error": error,
+        "ingestion": "fresh",
+        "scanned_at": "2026-09-06T20:00:00+00:00",
+        "total": total,
+        "total_configured": total,
+        "total_configured_scope": ["honk", "guardian"],
+        "not_configured": [],
+        "stale_24h": stale_24h,
+        "stale_7d": stale_7d,
+        "by_source": {
+            "honk": {"open": 2, "stale_24h": 1, "stale_7d": 0, "oldest_unacked": "2026-09-05T10:00:00+00:00"},
+            "guardian": {"open": None, "stale_24h": None, "stale_7d": None, "oldest_unacked": None},
+        },
+        "corrupt_rows": 0,
+        "source_status": {"honk": "ok", "guardian": "unavailable"},
+        "sources_degraded": ["guardian"],
+    }
+
+
+# The two TEXT-returning doors. The bridge json.loads a tool's TextContent and
+# falls back to the raw string, so these arrive as `result` STRINGS.
+FAKE_ARRIVAL_TEXT = (
+    "\u2748 ARRIVE_LINEAGE \u2014 relational arrival\n\n"
+    "\u2501\u2501\u2501 SPIRAL STATUS \u2501\u2501\u2501\n  Session: spiral_test\n\n"
+    "\u2501\u2501\u2501 COMMS \u2014 LINEAGE \u2501\u2501\u2501\n"
+    "  to_arrival: showing 5 of 13 \u2014 8 older withheld by limit_per_bucket\n"
+)
+FAKE_POLICIES_TEXT = (
+    "\U0001f4dc Standing policies \u2014 13 active\n\n"
+    "  pol_20260804_delegation-tier-law \u2014 active\n\n---\n"
+    "Source of truth: /fake/policies.jsonl (append-only; latest record per policy_id wins).\n"
+    "13 active \u00b7 0 retired.\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Fake SEAT SOCKET bridge (the second transport)
+# ---------------------------------------------------------------------------
+
+
+class _UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
+    """The same handler, served over AF_UNIX.
+
+    BaseHTTPRequestHandler expects `client_address` to be a (host, port) tuple;
+    an AF_UNIX accept returns '' for it. Substituting a tuple here is the whole
+    adaptation — nothing about the HTTP behaviour changes, so the two transports
+    are tested against ONE server behaviour rather than two fixtures that could
+    drift apart.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        request, _ = super().get_request()
+        return request, ("127.0.0.1", 0)
+
+
+class SeatSocketBridge:
+    """A fake seat socket in a temp dir. Started per test class, torn down after."""
+
+    def __init__(self):
+        self.directory = tempfile.mkdtemp(prefix="temple-seat-sock-")
+        self.path = os.path.join(self.directory, "bridge.sock")
+        self.server = _UnixHTTPServer(self.path, FakeBridgeHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Subprocess harness
 # ---------------------------------------------------------------------------
 
 
 class ShimProcess:
-    """Spawn the shim as a real subprocess and speak newline-delimited JSON-RPC."""
+    """Spawn the shim as a real subprocess and speak newline-delimited JSON-RPC.
 
-    def __init__(self, base_url, *, max_chars=None, token=DUMMY_CREDENTIAL, env_file=None):
-        env = dict(os.environ)
-        env.pop("TEMPLE_BRIDGE_TOKEN", None)
-        env["TEMPLE_BRIDGE_URL"] = base_url
+    Transport is chosen the way the shim chooses it — by environment, never by
+    an argument the shim cannot see. `socket_path` selects the seat transport
+    (and then nothing selecting the grant transport is set at all); otherwise
+    the grant transport is used.
+    """
+
+    def __init__(
+        self,
+        base_url=None,
+        *,
+        max_chars=None,
+        value=DUMMY_CREDENTIAL,
+        socket_path=None,
+        seat=DUMMY_SEAT,
+        seat_name=DUMMY_SEAT_NAME,
+        env_file=None,
+        extra_env=None,
+    ):
+        env = clean_env()
         env["TEMPLE_MCP_TIMEOUT"] = "10"
-        if token is not None:
-            env["TEMPLE_BRIDGE_TOKEN"] = token
+        if socket_path is not None:
+            env["TEMPLE_BRIDGE_SOCKET"] = socket_path
+            if seat is not None:
+                env["SOVEREIGN_SEAT"] = seat
+        else:
+            if base_url is not None:
+                env["TEMPLE_BRIDGE_URL"] = base_url
+            if value is not None:
+                env["TEMPLE_BRIDGE_TOKEN"] = value
+        if seat_name is not None:
+            env["TEMPLE_SEAT_NAME"] = seat_name
         if max_chars is not None:
             env["TEMPLE_MCP_MAX_CHARS"] = str(max_chars)
-        env["TEMPLE_BRIDGE_ENV_FILE"] = env_file or os.path.join(tempfile.gettempdir(), "definitely-absent-env-file")
+        if env_file is not None:
+            env["TEMPLE_BRIDGE_ENV_FILE"] = env_file
+        if extra_env:
+            env.update(extra_env)
         self.proc = subprocess.Popen(
             [sys.executable, SHIM_PATH],
             stdin=subprocess.PIPE,
@@ -269,7 +457,8 @@ class ShimTestCase(unittest.TestCase):
             shim_proc.close()
 
     def spawn(self, **kwargs):
-        proc = ShimProcess(self.base_url, **kwargs)
+        kwargs.setdefault("base_url", self.base_url)
+        proc = ShimProcess(**kwargs)
         self.shims.append(proc)
         return proc
 
@@ -343,12 +532,15 @@ class TestToolsList(ShimTestCase):
         proc.handshake()
         return proc.request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
 
-    def test_exactly_four_tools(self):
+    def test_exactly_seven_tools(self):
         tools = self._tools()
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 7)
         self.assertEqual(
             {tool["name"] for tool in tools},
-            {"stack_recall", "stack_latest", "stack_open_threads", "stack_heartbeat"},
+            {
+                "stack_recall", "stack_latest", "stack_open_threads",
+                "stack_arrive", "stack_policies", "stack_signals", "stack_heartbeat",
+            },
         )
 
     def test_schemas(self):
@@ -383,6 +575,25 @@ class TestToolsList(ShimTestCase):
         heartbeat = by_name["stack_heartbeat"]["inputSchema"]
         self.assertEqual(heartbeat["properties"], {})
         self.assertFalse(heartbeat["additionalProperties"])
+
+        arrive = by_name["stack_arrive"]["inputSchema"]
+        self.assertEqual(arrive["required"], [])
+        self.assertFalse(arrive["additionalProperties"])
+        # The reader name is CONFIGURATION (TEMPLE_SEAT_NAME), never an argument:
+        # a model choosing its own name per call is how to_self routing is lost.
+        self.assertEqual(set(arrive["properties"]), {"limit_per_bucket"})
+        self.assertNotIn("source_instance", arrive["properties"])
+        self.assertNotIn("full_content", arrive["properties"])
+        self.assertEqual(arrive["properties"]["limit_per_bucket"]["maximum"], shim.BUCKET_MAX)
+        self.assertEqual(arrive["properties"]["limit_per_bucket"]["default"], shim.BUCKET_DEFAULT)
+
+        # Both no-argument doors: mode / domain / include_retired are pinned
+        # OUTSIDE the schema exactly the way `order` is on the recall doors.
+        for name in ("stack_policies", "stack_signals"):
+            schema = by_name[name]["inputSchema"]
+            self.assertEqual(schema["properties"], {}, name)
+            self.assertEqual(schema["required"], [], name)
+            self.assertFalse(schema["additionalProperties"], name)
 
     def test_every_tool_has_a_description(self):
         for tool in self._tools():
@@ -525,7 +736,10 @@ class TestToolCalls(ShimTestCase):
         text = self.text_of(self.call(proc, "stack_heartbeat"))
         self.assertIn("status: ok", text)
         self.assertIn("1.15.0-fake", text)
-        self.assertIn("97", text)
+        # 52, not 97: the fixture tracks the stack's published surface after the
+        # 2026-09-06 retirement of 48 uncalled tools. It is a FIXTURE, not a
+        # measurement — the live count is whatever /api/heartbeat says.
+        self.assertIn("tools: 52", text)
         self.assertEqual(STATE.calls, [], "heartbeat must not touch POST /api/call")
 
 
@@ -579,12 +793,50 @@ class TestTruncation(ShimTestCase):
 class TestReadOnlyBoundary(unittest.TestCase):
     """These test the internal functions directly — no server, no network."""
 
-    def test_allowlist_contains_only_the_two_read_tools(self):
-        # stack_latest reuses recall_insights: four doors, still only two POST
-        # targets and one GET path. The allowlist itself must not have grown.
-        self.assertEqual(shim.ALLOWED_BRIDGE_TOOLS, frozenset({"recall_insights", "get_open_threads"}))
+    def test_allowlist_is_exactly_the_five_read_tools(self):
+        # stack_latest reuses recall_insights: seven doors, five POST targets and
+        # one GET path. This constant IS the boundary — it is pinned by name so a
+        # widening is a diff a reviewer sees, and every name here is a READ.
+        self.assertEqual(
+            shim.ALLOWED_BRIDGE_TOOLS,
+            frozenset({
+                "recall_insights", "get_open_threads",
+                "arrive_lineage", "current_policies", "signals_summary",
+            }),
+        )
         self.assertEqual(shim.ALLOWED_BRIDGE_PATHS, frozenset({"/api/heartbeat"}))
-        self.assertEqual(len(shim.BRIDGE_TARGETS), 4)
+        self.assertEqual(len(shim.BRIDGE_TARGETS), 7)
+
+    def test_the_result_type_split_is_derived_from_the_one_allowlist(self):
+        """There is ONE widening constant for the POST lane, and this proves it.
+
+        `json_result_tools()` is computed from ALLOWED_BRIDGE_TOOLS at call time,
+        so the partition is total and disjoint BY CONSTRUCTION rather than by two
+        constants a future edit could let drift apart — and, the reason it is
+        written this way, widening the allowlist alone changes behaviour. A
+        second frozenset would have stood in front of the first and made law 3's
+        negative control (mutate the constant, watch the suite go red) come back
+        green while the boundary was in fact untested. See
+        tests/test_canary.py::test_allowlist_is_the_write_refusal_gate.
+        """
+        self.assertEqual(shim.TEXT_RESULT_TOOLS | shim.json_result_tools(), shim.ALLOWED_BRIDGE_TOOLS)
+        self.assertEqual(shim.TEXT_RESULT_TOOLS & shim.json_result_tools(), frozenset())
+        self.assertTrue(shim.TEXT_RESULT_TOOLS <= shim.ALLOWED_BRIDGE_TOOLS)
+
+        # The derivation tracks the allowlist rather than a remembered copy.
+        saved = shim.ALLOWED_BRIDGE_TOOLS
+        try:
+            shim.ALLOWED_BRIDGE_TOOLS = saved | frozenset({"canary_probe"})
+            self.assertIn("canary_probe", shim.json_result_tools())
+        finally:
+            shim.ALLOWED_BRIDGE_TOOLS = saved
+        self.assertNotIn("canary_probe", shim.json_result_tools())
+
+    def test_json_and_text_doors_refuse_each_other(self):
+        with self.assertRaises(shim.BridgeToolNotAllowed):
+            shim.bridge_call("current_policies", {}, transport=grant_transport("http://127.0.0.1:1"))
+        with self.assertRaises(shim.BridgeToolNotAllowed):
+            shim.bridge_call_text("recall_insights", {}, transport=grant_transport("http://127.0.0.1:1"))
 
     def test_bridge_call_refuses_non_allowlisted_tools(self):
         for forbidden in (
@@ -599,13 +851,18 @@ class TestReadOnlyBoundary(unittest.TestCase):
         ):
             with self.subTest(tool=forbidden):
                 with self.assertRaises(shim.BridgeToolNotAllowed):
-                    shim.bridge_call(forbidden, {}, token=DUMMY_CREDENTIAL, base_url="http://127.0.0.1:1")
+                    shim.bridge_call(forbidden, {}, transport=grant_transport("http://127.0.0.1:1"))
+                with self.assertRaises(shim.BridgeToolNotAllowed):
+                    shim.bridge_call_text(forbidden, {}, transport=grant_transport("http://127.0.0.1:1"))
 
     def test_refusal_happens_before_any_network_work(self):
-        # base_url points at a port nothing listens on. A BridgeError would mean
-        # the refusal came too late; BridgeToolNotAllowed means it came first.
+        # base_url points at a port nothing listens on, and the socket path does
+        # not exist. A BridgeError would mean the refusal came too late;
+        # BridgeToolNotAllowed means it came first, on BOTH transports.
         with self.assertRaises(shim.BridgeToolNotAllowed):
-            shim.bridge_call("record_insight", {"content": "x"}, token=DUMMY_CREDENTIAL, base_url="http://127.0.0.1:1")
+            shim.bridge_call("record_insight", {"content": "x"}, transport=grant_transport("http://127.0.0.1:1"))
+        with self.assertRaises(shim.BridgeToolNotAllowed):
+            shim._post_envelope("record_insight", {}, transport=seat_transport("/nonexistent/bridge.sock"))
 
     def test_exposed_tools_map_exactly_onto_the_allowlisted_targets(self):
         """No exposed tool may reach a target that is not allowlisted, and no
@@ -670,13 +927,36 @@ class TestFailsClosed(ShimTestCase):
         # A success-shaped failure must not be rendered as content.
         STATE.raw_response = json.dumps({"ok": True, "result": "Unknown tool: recall_insights", "duration_ms": 1})
         with self.assertRaises(shim.BridgeError) as caught:
-            shim.bridge_call("recall_insights", {"query": "x"}, token=DUMMY_CREDENTIAL, base_url=self.base_url)
+            shim.bridge_call("recall_insights", {"query": "x"}, transport=grant_transport(self.base_url))
         self.assertIn("Unknown tool", str(caught.exception))
+
+    def test_text_door_catches_the_same_fail_open_shape(self):
+        # The object-result guard cannot serve a text door, so the text door
+        # carries its own belt for a stack old enough to RETURN "Unknown tool"
+        # instead of raising. (On the deployed stack the envelope ok check gets
+        # there first; this is the older-stack case, stated as such.)
+        STATE.raw_response = json.dumps({"ok": True, "result": "Unknown tool: current_policies"})
+        with self.assertRaises(shim.BridgeError) as caught:
+            shim.bridge_call_text("current_policies", {}, transport=grant_transport(self.base_url))
+        self.assertIn("Unknown tool", str(caught.exception))
+
+    def test_text_door_refuses_an_object_result(self):
+        # The other half of the bidirectional pin: a tool that starts returning
+        # JSON must not be stringified into plausible prose.
+        STATE.payload_by_tool = {"current_policies": {"policies": []}}
+        with self.assertRaises(shim.BridgeError) as caught:
+            shim.bridge_call_text("current_policies", {}, transport=grant_transport(self.base_url))
+        self.assertIn("output shape changed", str(caught.exception))
+
+    def test_text_door_refuses_empty_text(self):
+        STATE.payload_by_tool = {"current_policies": "   "}
+        with self.assertRaises(shim.BridgeError):
+            shim.bridge_call_text("current_policies", {}, transport=grant_transport(self.base_url))
 
     def test_http_401_is_an_error_carrying_the_bridge_detail(self):
         with self.assertRaises(shim.BridgeError) as caught:
             shim.bridge_call("recall_insights", {"query": "x"},
-                             token=REJECTED_CREDENTIAL, base_url=self.base_url)
+                             transport=grant_transport(self.base_url, REJECTED_CREDENTIAL))
         message = str(caught.exception)
         self.assertIn("401", message)
         self.assertIn("failure_class", message)  # the bridge's own detail is relayed
@@ -685,16 +965,28 @@ class TestFailsClosed(ShimTestCase):
     def test_not_ok_envelope_is_an_error(self):
         STATE.raw_response = json.dumps({"ok": False, "error": "boom"})
         with self.assertRaises(shim.BridgeError):
-            shim.bridge_call("recall_insights", {"query": "x"}, token=DUMMY_CREDENTIAL, base_url=self.base_url)
+            shim.bridge_call("recall_insights", {"query": "x"}, transport=grant_transport(self.base_url))
+        # The same envelope check guards the text doors — one gate, both types.
+        with self.assertRaises(shim.BridgeError):
+            shim.bridge_call_text("current_policies", {}, transport=grant_transport(self.base_url))
 
-    def test_no_token_at_startup_exits_one_with_a_single_stderr_line(self):
-        proc = self.spawn(token=None, env_file=os.path.join(HERE, "does-not-exist.env"))
-        proc.proc.wait(timeout=10)
-        self.assertEqual(proc.proc.returncode, 1)
-        stderr = proc.proc.stderr.read().strip()
-        self.assertEqual(len(stderr.splitlines()), 1, f"expected one stderr line, got: {stderr!r}")
-        self.assertIn("no bridge token", stderr)
-        self.assertNotIn(DUMMY_CREDENTIAL, stderr)
+    def test_signal_ledger_blind_is_an_error_not_an_empty_queue(self):
+        # signals_summary answers ok:FALSE inside an ok:true envelope when the
+        # ledger cannot be read at all. That is a refusal, and rendering it as
+        # "0 unacked" would be this house's own fail-open reproduced.
+        STATE.payload_by_tool = {
+            "signals_summary": {"ok": False, "error": "signal_ledger_unavailable", "ingestion": "not_scanned"}
+        }
+        proc = self.spawn()
+        proc.handshake()
+        response = proc.request({
+            "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+            "params": {"name": "stack_signals", "arguments": {}},
+        })
+        self.assertTrue(response["result"]["isError"])
+        text = self.text_of(response)
+        self.assertIn("signal_ledger_unavailable", text)
+        self.assertNotIn("unacked total 0", text)
 
 
 # ---------------------------------------------------------------------------
@@ -702,44 +994,120 @@ class TestFailsClosed(ShimTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestTokenHandling(unittest.TestCase):
-    def test_importing_the_module_does_not_exit_without_a_token(self):
-        # Already proven by this file importing at module scope, but assert the
-        # contract explicitly so a future refactor cannot quietly break tests.
-        self.assertTrue(callable(shim.load_token))
+class TestTransportResolution(unittest.TestCase):
+    """The credential path: two transports, chosen by configuration, never guessed.
 
-    def test_env_file_parsing(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "bridge.env")
-            lines = [
-                "# a comment",
-                "",
-                f"{shim.TOKEN_ENV_KEY}={DUMMY_CREDENTIAL}",
-                'OTHER_KEY="quoted value"',
-                "export EXPORTED_KEY=exported-value",
-                "MALFORMED_LINE_NO_EQUALS",
-            ]
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("\n".join(lines) + "\n")
-            parsed = shim.parse_env_file(path)
-            self.assertEqual(parsed[shim.TOKEN_ENV_KEY], DUMMY_CREDENTIAL)
-            self.assertEqual(parsed["OTHER_KEY"], "quoted value")
-            self.assertEqual(parsed["EXPORTED_KEY"], "exported-value")
-            self.assertNotIn("MALFORMED_LINE_NO_EQUALS", parsed)
+    Anthony's rule of 2026-09-05 forbids the master key as a seat credential
+    everywhere. Until 0.4.0 this shim read it out of a shell-sourceable env file
+    by default, which is exactly the thing the rule forbids, so that path is
+    gone and its variable is refused by name.
+    """
 
-    def test_missing_env_file_returns_empty_not_an_exception(self):
-        self.assertEqual(shim.parse_env_file("/nonexistent/path/to/bridge.env"), {})
+    def setUp(self):
+        self._saved = {name: os.environ.get(name) for name in TRANSPORT_ENV_VARS}
+        for name in TRANSPORT_ENV_VARS:
+            os.environ.pop(name, None)
 
-    def test_env_override_wins_over_the_file(self):
-        previous = os.environ.get("TEMPLE_BRIDGE_TOKEN")
-        os.environ["TEMPLE_BRIDGE_TOKEN"] = DUMMY_CREDENTIAL
-        try:
-            self.assertEqual(shim.load_token(), DUMMY_CREDENTIAL)
-        finally:
-            if previous is None:
-                os.environ.pop("TEMPLE_BRIDGE_TOKEN", None)
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
             else:
-                os.environ["TEMPLE_BRIDGE_TOKEN"] = previous
+                os.environ[name] = value
+
+    def test_importing_the_module_does_not_exit_without_a_transport(self):
+        # Resolution is lazy, inside main()/resolve_transport(), precisely so
+        # importing the module for testing never touches it.
+        self.assertTrue(callable(shim.resolve_transport))
+
+    def test_the_env_file_variable_is_refused_by_name(self):
+        os.environ[shim.ENV_FILE_VAR] = "/tmp/anything.env"
+        os.environ[shim.TOKEN_ENV_VAR] = DUMMY_CREDENTIAL
+        with self.assertRaises(shim.TransportRefused) as caught:
+            shim.resolve_transport()
+        message = str(caught.exception)
+        self.assertIn(shim.ENV_FILE_VAR, message)
+        self.assertIn("never carries the master key", message)
+        # The refusal names both real doors, so the redirect is actionable.
+        self.assertIn(shim.SEAT_ENV_VAR, message)
+        self.assertIn(shim.TOKEN_ENV_VAR, message)
+
+    def test_the_env_file_reader_is_gone_entirely(self):
+        # Not merely bypassed: the parser and its constants are deleted, so no
+        # future edit can reconnect the master key by flipping one branch.
+        for attribute in ("parse_env_file", "load_token", "DEFAULT_ENV_FILE", "TOKEN_ENV_KEY"):
+            self.assertFalse(hasattr(shim, attribute), f"{attribute} still exists")
+
+    def test_seat_transport_resolves_from_the_seat_variable_alone(self):
+        os.environ[shim.SEAT_ENV_VAR] = DUMMY_SEAT
+        transport = shim.resolve_transport()
+        self.assertEqual(transport.kind, "seat")
+        self.assertEqual(transport.seat, DUMMY_SEAT)
+        self.assertEqual(transport.socket_path, os.path.expanduser(shim.DEFAULT_SEAT_SOCKET))
+        self.assertIsNone(transport.token)
+
+    def test_socket_override_wins_over_the_default_path(self):
+        os.environ[shim.SEAT_ENV_VAR] = DUMMY_SEAT
+        os.environ[shim.SOCKET_ENV_VAR] = "/tmp/elsewhere.sock"
+        self.assertEqual(shim.resolve_transport().socket_path, "/tmp/elsewhere.sock")
+
+    def test_socket_without_a_seat_id_is_refused(self):
+        os.environ[shim.SOCKET_ENV_VAR] = "/tmp/elsewhere.sock"
+        with self.assertRaises(shim.TransportRefused) as caught:
+            shim.resolve_transport()
+        self.assertIn(shim.SEAT_ENV_VAR, str(caught.exception))
+
+    def test_grant_transport_resolves_from_the_token_variable(self):
+        os.environ[shim.TOKEN_ENV_VAR] = DUMMY_CREDENTIAL
+        transport = shim.resolve_transport()
+        self.assertEqual(transport.kind, "grant")
+        self.assertIsNone(transport.seat)
+
+    def test_both_transports_configured_is_refused_not_ordered(self):
+        # "Chosen by configuration, never by guessing" means an ambiguous
+        # configuration has no winner. A precedence rule here would be a guess
+        # wearing a policy costume.
+        os.environ[shim.SEAT_ENV_VAR] = DUMMY_SEAT
+        os.environ[shim.TOKEN_ENV_VAR] = DUMMY_CREDENTIAL
+        with self.assertRaises(shim.TransportRefused) as caught:
+            shim.resolve_transport()
+        message = str(caught.exception)
+        self.assertIn("two transports", message)
+        self.assertIn("never by guessing", message)
+
+    def test_no_transport_at_all_is_refused_and_names_both_doors(self):
+        with self.assertRaises(shim.TransportRefused) as caught:
+            shim.resolve_transport()
+        message = str(caught.exception)
+        self.assertIn(shim.SEAT_ENV_VAR, message)
+        self.assertIn(shim.TOKEN_ENV_VAR, message)
+
+    def test_resolution_is_not_cached(self):
+        os.environ[shim.TOKEN_ENV_VAR] = DUMMY_CREDENTIAL
+        self.assertEqual(shim.resolve_transport().kind, "grant")
+        os.environ.pop(shim.TOKEN_ENV_VAR)
+        os.environ[shim.SEAT_ENV_VAR] = DUMMY_SEAT
+        self.assertEqual(shim.resolve_transport().kind, "seat")
+
+    def test_no_transport_at_startup_exits_one_with_a_single_stderr_line(self):
+        proc = subprocess.run(
+            [sys.executable, SHIM_PATH], input="", capture_output=True, text=True,
+            env=clean_env(), timeout=30,
+        )
+        self.assertEqual(proc.returncode, 1)
+        stderr = proc.stderr.strip()
+        self.assertEqual(len(stderr.splitlines()), 1, f"expected one stderr line, got: {stderr!r}")
+        self.assertIn("no transport is configured", stderr)
+
+    def test_the_env_file_variable_also_stops_startup(self):
+        proc = subprocess.run(
+            [sys.executable, SHIM_PATH], input="", capture_output=True, text=True,
+            env=clean_env(**{shim.ENV_FILE_VAR: "/tmp/anything.env", shim.TOKEN_ENV_VAR: DUMMY_CREDENTIAL}),
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(shim.ENV_FILE_VAR, proc.stderr)
+        self.assertNotIn(DUMMY_CREDENTIAL, proc.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -813,13 +1181,15 @@ class TestRedirects(unittest.TestCase):
         Bounce.sink_url = f"http://127.0.0.1:{sink.server_address[1]}/sink"
         threading.Thread(target=sink.serve_forever, daemon=True).start()
         threading.Thread(target=bounce.serve_forever, daemon=True).start()
-        token = "redirect-probe-token-123456"
+        probe = "redirect-probe-value-123456"
         try:
             with self.assertRaises(shim.BridgeError) as ctx:
                 shim._http_json(
                     "GET",
-                    f"http://127.0.0.1:{bounce.server_address[1]}/start",
-                    token=token,
+                    "/start",
+                    transport=grant_transport(
+                        f"http://127.0.0.1:{bounce.server_address[1]}", probe
+                    ),
                     timeout=2,
                 )
             self.assertIn("redirect", str(ctx.exception).lower())
@@ -829,6 +1199,420 @@ class TestRedirects(unittest.TestCase):
             sink.shutdown()
             bounce.server_close()
             sink.server_close()
+
+
+
+# ---------------------------------------------------------------------------
+# The SEAT SOCKET transport
+# ---------------------------------------------------------------------------
+
+
+class SeatSocketTestCase(unittest.TestCase):
+    """One fake seat socket for the class; one shim process per test."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bridge = SeatSocketBridge()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.bridge.close()
+
+    def setUp(self):
+        STATE.reset()
+        self.shims = []
+
+    def tearDown(self):
+        for proc in self.shims:
+            proc.close()
+
+    def spawn(self, **kwargs):
+        kwargs.setdefault("socket_path", self.bridge.path)
+        proc = ShimProcess(**kwargs)
+        self.shims.append(proc)
+        return proc
+
+    @staticmethod
+    def text_of(response):
+        content = response["result"]["content"]
+        return "".join(part["text"] for part in content if part.get("type") == "text")
+
+
+class TestSeatSocketTransport(SeatSocketTestCase):
+    def test_a_call_over_the_socket_sends_the_seat_header_and_no_authorization(self):
+        """The whole point of the seat transport: identity, no credential.
+
+        The bridge decides on the ORDER — an Authorization header of any kind
+        routes to the bearer check and the seat path is never reached — so a
+        shim that sent both would not be "belt and braces", it would silently
+        stop being a seat.
+        """
+        proc = self.spawn()
+        proc.handshake()
+        response = proc.request({
+            "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+            "params": {"name": "stack_recall", "arguments": {"query": "temple-harness"}},
+        })
+        self.assertFalse(response["result"]["isError"], self.text_of(response))
+        self.assertEqual(STATE.header_of("X-Sovereign-Seat"), DUMMY_SEAT)
+        self.assertIsNone(STATE.header_of("Authorization"))
+        self.assertEqual(STATE.calls[0]["tool"], "recall_insights")
+
+    def test_the_heartbeat_also_rides_the_socket(self):
+        proc = self.spawn()
+        proc.handshake()
+        response = proc.request({
+            "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+            "params": {"name": "stack_heartbeat", "arguments": {}},
+        })
+        text = self.text_of(response)
+        self.assertIn("seat socket", text)
+        self.assertIn(DUMMY_SEAT, text)
+        self.assertIsNone(STATE.header_of("Authorization"))
+
+    def test_a_wrong_seat_id_is_refused_by_the_bridge_and_fails_closed(self):
+        proc = self.spawn(seat="not-a-registered-seat")
+        proc.handshake()
+        response = proc.request({
+            "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+            "params": {"name": "stack_recall", "arguments": {"query": "x"}},
+        })
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("401", self.text_of(response))
+
+    def test_an_absent_socket_is_a_legible_error_not_an_empty_result(self):
+        proc = self.spawn(socket_path=os.path.join(self.bridge.directory, "no-such.sock"))
+        proc.handshake()
+        response = proc.request({
+            "jsonrpc": "2.0", "id": 33, "method": "tools/call",
+            "params": {"name": "stack_recall", "arguments": {"query": "x"}},
+        })
+        self.assertTrue(response["result"]["isError"])
+        text = self.text_of(response)
+        self.assertIn("seat socket not found", text)
+        self.assertIn("failed call, not an empty result", text)
+
+    def test_a_bound_but_unlistening_socket_says_nothing_is_accepting(self):
+        """The live failure of 2026-09-06, kept as a test.
+
+        A socket file that exists while nothing accepts on it is a SERVER fact.
+        Reported as a generic transport error it reads as a client fault, and an
+        operator spends the evening on the wrong side of the connection.
+        """
+        directory = tempfile.mkdtemp(prefix="temple-seat-bound-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "bridge.sock")
+        bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound.bind(path)  # bind WITHOUT listen: the exact live shape
+        self.addCleanup(bound.close)
+        with self.assertRaises(shim.BridgeError) as caught:
+            shim.bridge_call("recall_insights", {"query": "x"},
+                             transport=seat_transport(path), timeout=5)
+        message = str(caught.exception)
+        self.assertIn("nothing is", message)
+        self.assertIn("check the bridge, not this shim", message)
+
+    def test_a_redirect_on_the_socket_is_refused_too(self):
+        """Law 2 on the transport this shim gained, not only the one it had.
+
+        There is no Authorization header to steal here, which is exactly why the
+        refusal has to be justified on its own terms: following a 3xx would mean
+        trusting a hop nobody verified, and the bridge has no legitimate redirect
+        on either transport.
+        """
+        STATE.raw_response = None
+        directory = tempfile.mkdtemp(prefix="temple-seat-redirect-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "bridge.sock")
+
+        class Bounce(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", "http://example.invalid/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = _UnixHTTPServer(path, Bounce)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(shim.BridgeError) as caught:
+                shim.bridge_call(
+                    "recall_insights", {"query": "x"},
+                    transport=seat_transport(path), timeout=5,
+                )
+            self.assertIn("redirect", str(caught.exception).lower())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# The three new doors
+# ---------------------------------------------------------------------------
+
+
+class TestNewDoors(ShimTestCase):
+    def call(self, proc, name, arguments=None, request_id=40):
+        return proc.request({
+            "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        })
+
+    # -- stack_arrive --------------------------------------------------------
+
+    def test_arrive_forwards_the_reader_full_content_and_a_clamped_bucket(self):
+        STATE.payload_by_tool = {"arrive_lineage": FAKE_ARRIVAL_TEXT}
+        proc = self.spawn()
+        proc.handshake()
+        response = self.call(proc, "stack_arrive", {"limit_per_bucket": 500})
+        self.assertFalse(response["result"]["isError"], self.text_of(response))
+        forwarded = STATE.calls[0]
+        self.assertEqual(forwarded["tool"], "arrive_lineage")
+        self.assertEqual(forwarded["arguments"]["source_instance"], DUMMY_SEAT_NAME)
+        self.assertIs(forwarded["arguments"]["full_content"], True)
+        self.assertEqual(forwarded["arguments"]["limit_per_bucket"], shim.BUCKET_MAX)
+
+    def test_arrive_renders_the_doors_own_text_under_a_coverage_line(self):
+        STATE.payload_by_tool = {"arrive_lineage": FAKE_ARRIVAL_TEXT}
+        proc = self.spawn(max_chars=8000)
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_arrive"))
+        self.assertIn("arrival coverage:", text)
+        self.assertIn(DUMMY_SEAT_NAME, text)
+        self.assertIn("does not re-count", text)
+        self.assertIn("ARRIVE_LINEAGE", text)
+
+    def test_arrive_refuses_when_the_reader_name_is_unset(self):
+        proc = self.spawn(seat_name=None)
+        proc.handshake()
+        response = self.call(proc, "stack_arrive")
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("TEMPLE_SEAT_NAME", self.text_of(response))
+        self.assertEqual(STATE.calls, [], "a refused door must not reach the bridge")
+
+    def test_arrive_refuses_a_decorated_reader_name(self):
+        # The documented trap: the to_self addressee filter matches the BARE
+        # model name only, so a decorated seat string hides that line's letters.
+        proc = self.spawn(seat_name="HQ Mac Studio - claude-fable-5")
+        proc.handshake()
+        response = self.call(proc, "stack_arrive")
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("decorated", self.text_of(response))
+        self.assertEqual(STATE.calls, [])
+
+    # -- stack_policies ------------------------------------------------------
+
+    def test_policies_sends_no_filter_and_states_its_coverage(self):
+        STATE.payload_by_tool = {"current_policies": FAKE_POLICIES_TEXT}
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_policies"))
+        self.assertEqual(STATE.calls[0], {"tool": "current_policies", "arguments": {}})
+        self.assertIn("policies coverage:", text)
+        self.assertIn("Standing policies", text)
+
+    # -- stack_signals -------------------------------------------------------
+
+    def test_signals_pins_summary_mode_outside_the_schema(self):
+        STATE.payload_by_tool = {"signals_summary": default_signals_summary()}
+        proc = self.spawn()
+        proc.handshake()
+        self.call(proc, "stack_signals")
+        self.assertEqual(STATE.calls[0]["arguments"], {"mode": "summary"})
+
+    def test_signals_renders_every_field_the_contract_names(self):
+        STATE.payload_by_tool = {"signals_summary": default_signals_summary()}
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_signals"))
+        self.assertIn("signals coverage:", text)
+        self.assertIn("unacked total 3", text)
+        self.assertIn("stale_24h 1", text)
+        self.assertIn("stale_7d 0", text)
+        self.assertIn("ingestion: fresh", text)
+        self.assertIn("honk:", text)
+        self.assertIn("guardian:", text)
+
+    def test_signals_never_renders_a_zero_the_envelope_did_not_measure(self):
+        """A null count is 'unmeasured'. Printing 0 would be the house fail-open.
+
+        The guardian source in the fixture is unavailable, so every one of its
+        counts is null; the aggregate `total` is null too when the ledger could
+        not answer. Neither may read as a healthy zero.
+        """
+        STATE.payload_by_tool = {
+            "signals_summary": default_signals_summary(total=None, stale_24h=None, stale_7d=None)
+        }
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_signals"))
+        self.assertIn("unacked total unmeasured", text)
+        self.assertIn("stale_24h unmeasured", text)
+        self.assertNotIn("unacked total 0", text)
+        self.assertIn("guardian: oldest_unacked unmeasured", text)
+
+    def test_signals_renders_a_scalar_per_source_count_as_measured(self):
+        """The mirror of the zero: a real count must not print as 'unmeasured'.
+
+        summary mode returns a per-source object today, but the heartbeat carries
+        the same field as flat ints, and a renderer that answers 'unmeasured' to a
+        measured 317 is lying in the other direction.
+        """
+        payload = default_signals_summary()
+        payload["by_source"] = {"honk": 317, "guardian": None}
+        STATE.payload_by_tool = {"signals_summary": payload}
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_signals"))
+        self.assertIn("honk: open 317", text)
+        self.assertIn("guardian: open unmeasured", text)
+
+    def test_signals_partial_read_shows_counts_and_an_error_line(self):
+        # ok:true WITH an error is a partial read: real rows, something else
+        # unmeasured. It is neither all-clear nor a failed call.
+        STATE.payload_by_tool = {
+            "signals_summary": default_signals_summary(error="guardian probe unavailable")
+        }
+        proc = self.spawn()
+        proc.handshake()
+        response = self.call(proc, "stack_signals")
+        self.assertFalse(response["result"]["isError"])
+        text = self.text_of(response)
+        self.assertIn("error: guardian probe unavailable", text)
+        self.assertIn("PARTIAL read, not all-clear", text)
+        self.assertIn("unacked total 3", text)
+
+    # -- heartbeat -----------------------------------------------------------
+
+    def test_heartbeat_carries_the_unacked_signal_total(self):
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_heartbeat"))
+        self.assertIn("unacked signals: 3", text)
+
+    def test_heartbeat_unmeasured_signals_do_not_read_as_zero(self):
+        STATE.heartbeat = dict(
+            STATE.heartbeat,
+            unacked_signals={"total": None, "error": "signal_ledger_unavailable"},
+        )
+        self.addCleanup(STATE.heartbeat.pop, "unacked_signals", None)
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_heartbeat"))
+        self.assertIn("unacked signals: unmeasured", text)
+        self.assertIn("signal_ledger_unavailable", text)
+
+
+class TestNewDoorTruncation(ShimTestCase):
+    def test_arrival_truncation_states_both_numbers_and_keeps_the_coverage_line(self):
+        """Two truncations, kept distinguishable — and coverage survives the cut.
+
+        The coverage line is rendered FIRST for exactly this reason: a character
+        cap that ate the coverage statement would leave a partial result looking
+        whole, which is the failure the coverage line exists to prevent.
+        """
+        STATE.payload_by_tool = {"arrive_lineage": "L" * 5000}
+        proc = self.spawn(max_chars=400)
+        proc.handshake()
+        text = self.text_of(proc.request({
+            "jsonrpc": "2.0", "id": 45, "method": "tools/call",
+            "params": {"name": "stack_arrive", "arguments": {}},
+        }))
+        self.assertIn("arrival coverage:", text)
+        self.assertIn("[truncated, 400 of ", text)
+
+    def test_policies_truncation_states_both_numbers(self):
+        STATE.payload_by_tool = {"current_policies": "P" * 5000}
+        proc = self.spawn(max_chars=300)
+        proc.handshake()
+        text = self.text_of(proc.request({
+            "jsonrpc": "2.0", "id": 46, "method": "tools/call",
+            "params": {"name": "stack_policies", "arguments": {}},
+        }))
+        self.assertIn("policies coverage:", text)
+        self.assertIn("[truncated, 300 of ", text)
+
+
+class TestArrivalOverrideIsStated(unittest.TestCase):
+    """The seat transport OVERRIDES source_instance, and that is coverage.
+
+    seat_identity.sign_arguments stamps the kernel-verified seat id over
+    whatever the body said, for arrive_lineage among others. So on the Studio
+    the door filters to_self letters for a REGISTRY SEAT ID, not for the bare
+    model name this shim asked with. An empty to_self bucket is then a routing
+    fact, and a reader not told that will read it as an absence.
+    """
+
+    def test_seat_transport_render_names_the_override(self):
+        text = shim.render_arrival("body", "claude-fable-5", 5, seat_transport("/tmp/x.sock"))
+        self.assertIn("OVERRODE source_instance", text)
+        self.assertIn(DUMMY_SEAT, text)
+        self.assertIn("not evidence of no mail", text)
+
+    def test_grant_transport_render_does_not_claim_an_override(self):
+        text = shim.render_arrival("body", "claude-fable-5", 5, grant_transport("http://x"))
+        self.assertNotIn("OVERRODE", text)
+        self.assertIn("arrival coverage:", text)
+
+
+class TestDumpConfigTransport(unittest.TestCase):
+    """--dump-config states WHICH transport resolved and WHY, never a value."""
+
+    def _run(self, **overrides):
+        return subprocess.run(
+            [sys.executable, SHIM_PATH, "--dump-config"],
+            capture_output=True, text=True, env=clean_env(**overrides), timeout=30,
+        )
+
+    def test_seat_transport_is_reported_with_its_reason(self):
+        proc = self._run(SOVEREIGN_SEAT=DUMMY_SEAT)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("transport: seat", proc.stdout)
+        self.assertIn("SOVEREIGN_SEAT is set", proc.stdout)
+        self.assertIn("X-Sovereign-Seat: " + DUMMY_SEAT, proc.stdout)
+        self.assertIn("authorization: none sent", proc.stdout)
+
+    def test_grant_transport_is_reported_without_the_value(self):
+        proc = self._run(TEMPLE_BRIDGE_TOKEN=SENTINEL_VALUE)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("transport: grant", proc.stdout)
+        self.assertIn("TEMPLE_BRIDGE_TOKEN is set", proc.stdout)
+        self.assertNotIn(SENTINEL_VALUE, proc.stdout)
+        self.assertNotIn(SENTINEL_VALUE, proc.stderr)
+
+    def test_ambiguity_is_reported_as_the_resolved_state_not_an_exit_code(self):
+        # Inspection must not require a working configuration: dump-config is
+        # how an operator SEES a broken one.
+        proc = self._run(SOVEREIGN_SEAT=DUMMY_SEAT, TEMPLE_BRIDGE_TOKEN=SENTINEL_VALUE)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("transport: ABSENT", proc.stdout)
+        self.assertIn("two transports", proc.stdout)
+        self.assertNotIn(SENTINEL_VALUE, proc.stdout)
+
+    def test_the_env_file_refusal_is_visible_in_the_dump(self):
+        proc = self._run(TEMPLE_BRIDGE_ENV_FILE="/tmp/anything.env")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("transport: ABSENT", proc.stdout)
+        self.assertIn("never carries the master key", proc.stdout)
+
+    def test_the_result_type_split_is_printed(self):
+        proc = self._run(SOVEREIGN_SEAT=DUMMY_SEAT)
+        self.assertIn("object-result doors:", proc.stdout)
+        self.assertIn("text-result doors:", proc.stdout)
+        for name in sorted(shim.ALLOWED_BRIDGE_TOOLS):
+            self.assertIn(name, proc.stdout)
+
+    def test_the_reader_name_presence_is_reported(self):
+        absent = self._run(SOVEREIGN_SEAT=DUMMY_SEAT)
+        self.assertIn("TEMPLE_SEAT_NAME): ABSENT", absent.stdout)
+        present = self._run(SOVEREIGN_SEAT=DUMMY_SEAT, TEMPLE_SEAT_NAME=DUMMY_SEAT_NAME)
+        self.assertIn("TEMPLE_SEAT_NAME): " + DUMMY_SEAT_NAME, present.stdout)
+
 
 
 if __name__ == "__main__":
