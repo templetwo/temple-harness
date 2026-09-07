@@ -169,6 +169,33 @@ Transport resolution is **lazy** (inside `main()` / `resolve_transport()`) and
 **uncached**, so importing the module for testing never touches it and a running
 server can never serve a stale answer.
 
+### Ceilings are refused or reported, never silently applied
+
+`stack_arrive` **refuses** a `limit_per_bucket` outside 1-20 and names the
+ceiling and the value asked. That mirrors `arrive_lineage`, which refuses rather
+than clamps for its own 1..100 range, in its own words because *"a clamped
+request reads as an honoured one"*.
+
+`stack_recall` / `stack_latest` / `stack_open_threads` still clamp `limit` to 10
+— that behaviour predates this release — but the coverage line now says so:
+`limit: 10 (asked 500, served 10; this shim's max is 10)`. When the ceiling did
+not bite, the clause is absent. Either way the caller can tell whether the
+request it made is the request that ran.
+
+### Protected material: stated, per transport
+
+`stack_arrive` reads with `full_content: true`, so what the door is allowed to
+show matters and differs by transport:
+
+- **Seat socket** — the bridge withholds designated protected records,
+  structurally and by text redaction, before the payload reaches this shim.
+- **Scoped grant** — it does **not**. Whatever the grant reaches, the caller
+  reads, under the consent gate's own terms.
+
+The result says which one applied. That asymmetry is open thread
+`thread_20260906_163418_a19759f8`, at Anthony's gate; this shim states it rather
+than gating on it.
+
 ### `TEMPLE_SEAT_NAME` is not `SOVEREIGN_SEAT`
 
 A seat id is a registry entry (`hq-claude-studio`). A reader name is a model line
