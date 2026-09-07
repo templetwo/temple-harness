@@ -46,20 +46,52 @@ retired; none of this shim's doors among them).
 
 **Result-type pin (law 3).** The bridge `json.loads` a tool's output and falls
 back to the raw string, so `arrive_lineage` and `current_policies` arrive as
-STRINGS. `TEXT_RESULT_TOOLS` / `JSON_RESULT_TOOLS` partition the allowlist, a test
-asserts the partition is total and disjoint, and each helper refuses the other's
-type — a string where an object belongs is the bridge's fail-open costume, an
-object where text belongs is a changed tool shape.
+STRINGS. `TEXT_RESULT_TOOLS` names the prose doors; `json_result_tools()` derives
+the rest from `ALLOWED_BRIDGE_TOOLS` at call time, so the partition is total and
+disjoint by construction. Each helper refuses the other's type — a string where
+an object belongs is the bridge's fail-open costume, an object where text belongs
+is a changed tool shape.
+
+**ONE widening constant, and the canary is why.** The first draft of this branch
+carried `JSON_RESULT_TOOLS` as a second frozenset. That set stood in front of the
+allowlist, so widening `ALLOWED_BRIDGE_TOOLS` alone changed nothing — and
+`tests/test_canary.py::test_allowlist_is_the_write_refusal_gate` (PR #5, the
+MacBook seat) performs exactly that mutation and demands the call reach the
+network. Deriving the object-door set fixes the boundary rather than the test.
+Measured by hand: derived + widened allowlist raises `BridgeError` (reached the
+network, as the canary demands); re-frozen + widened allowlist still raises
+`BridgeToolNotAllowed` — the false green the canary exists to catch.
+
+**Canary plumbing, assertions untouched.** `test_canary.py` called
+`bridge_call(..., token=…, base_url=…)` and `_http_json("GET", url, token=…)`.
+Those parameters are deleted with the env-file credential path, so the canary now
+builds a `Transport` and passes `transport=`. Every assertion, every mutation and
+every restore is unchanged. Two canaries added for gates this release created:
+the text lane is gated by the same one constant, and the master-key env-file
+refusal stops firing when its variable name is pointed elsewhere.
 
 **Version.** 0.3.1 → 0.4.0, so the `User-Agent` becomes `temple-stack/0.4.0`. That
 string identifies harness traffic in bridge logs; a grep pinned to
 `temple-stack/0.3.1` goes blind on this release.
 
+### reconcile with main (PRs #5 and #6, MacBook seat, same night)
+
+- **PR #5's canary** (`mcp-shim/tests/test_canary.py`) drives the real gates now.
+  Its assertions, mutations and restores are untouched; only the way a call names
+  its destination changed, because `token=` / `base_url=` went out with the
+  env-file credential path. Two canaries added for gates this release created.
+- **PR #6's `test_readme_claims.py`** kept verbatim and extended with three
+  assertions DERIVED from the code — every door named in both READMEs, every
+  allowlisted POST target named in the boundary comment — so the docs cannot rot
+  the way a count does. The prose now lists the doors instead of counting them,
+  and the numeric test count is gone from the shim README for the same reason.
+
 ### tests
 
-- 38 → 98. Two fake bridges from one handler (TCP for the grant transport, a Unix
-  socket for the seat transport), so the two paths are not two fixtures that can
-  drift apart.
+- 38 → 111 (including PR #5's 4 canaries and PR #6's claims tests, now 7). Two
+  fake bridges from one handler (TCP for the grant transport, a Unix socket for
+  the seat transport), so the two paths are not two fixtures that can drift
+  apart.
 - **`test_conventions.py::TestCoverageAlwaysStated` no longer iterates a
   hand-written list of three doors** — that was a fail-open in the law-1 check
   itself: a new door needed no coverage line to stay green. It now drives off

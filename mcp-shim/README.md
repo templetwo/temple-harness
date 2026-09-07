@@ -12,19 +12,20 @@ can drive it.
 - **One file**, `temple_stack_mcp.py`, executable.
 - **Stdlib only** (`urllib`, `http.client`, `socket`, `json`, `sys`, `os`). No pip,
   no venv, no wheels. It runs anywhere `python3` exists.
-- Verified on Python 3.14.5 (the Mac Studio's Homebrew `python3`); written
-  against 3.12+ syntax.
+- Verified on Python 3.14.x (Studio) and 3.11; syntax floor 3.10 — CI runs 3.10,
+  3.11 and 3.12.
 
 ## The read-only boundary, and why
 
-The shim exposes **exactly seven tools, all reads**, and there is **no
-pass-through tool** — a caller cannot name a bridge tool, it can only pick one of
-seven doors that were opened for it.
+Every tool this shim exposes is a READ, and there is **no pass-through tool** — a
+caller cannot name a bridge tool, it can only pick one of the doors below.
+The doors are listed, not counted: a count in prose rots the moment one is added,
+and `tests/test_readme_claims.py` holds this table to the code.
 
 | MCP tool | Bridge target | Method | Result |
 |---|---|---|---|
 | `stack_recall` | `recall_insights` | POST `/api/call` | object |
-| `stack_latest` | `recall_insights` | POST `/api/call` | object |
+| `stack_latest` | `recall_insights` (same allowlist; order=newest, no query) | POST `/api/call` | object |
 | `stack_open_threads` | `get_open_threads` | POST `/api/call` | object |
 | `stack_arrive` | `arrive_lineage` | POST `/api/call` | text |
 | `stack_policies` | `current_policies` | POST `/api/call` | text |
@@ -44,10 +45,21 @@ ALLOWED_BRIDGE_PATHS = frozenset({"/api/heartbeat"})
 **The result column is part of the boundary, not documentation.** The bridge
 `json.loads` a tool's output and falls back to the raw string, so `result` is an
 object for tools that emit JSON and a string for tools that emit rendered prose.
-`TEXT_RESULT_TOOLS` and `JSON_RESULT_TOOLS` partition the allowlist, a test
-asserts the partition is total and disjoint, and each helper refuses the other's
-type — a string where an object belongs is the bridge's fail-open costume, and an
-object where text belongs means the tool changed shape underneath us.
+`TEXT_RESULT_TOOLS` names the prose doors and `json_result_tools()` **derives**
+the rest from `ALLOWED_BRIDGE_TOOLS` at call time; each helper refuses the
+other's type — a string where an object belongs is the bridge's fail-open
+costume, and an object where text belongs means the tool changed shape
+underneath us.
+
+**Why derived and not a second frozenset.** A second set would stand in front of
+the first, and then widening `ALLOWED_BRIDGE_TOOLS` alone would change nothing —
+so a reviewer performing law 3's negative control would mutate the boundary,
+watch the suite stay green, and conclude the allowlist was not load-bearing.
+`tests/test_canary.py` performs exactly that mutation. **One** constant widens
+the POST lane. Measured by hand: with the derivation, widening the allowlist lets
+the call reach the network (`BridgeError`); with a re-frozen second set the same
+mutation still returns `BridgeToolNotAllowed`, which is the false green the
+canary exists to catch.
 
 `bridge_call()` raises `BridgeToolNotAllowed` for anything outside that set
 **before it builds a request**, so a bug elsewhere in the file cannot widen the
@@ -242,19 +254,19 @@ cd mcp-shim
 python3 -m unittest discover -s tests -v
 ```
 
-98 tests, stdlib `unittest`, no external deps. They stand up **two fake bridges** —
-one on a random localhost port for the grant transport, one on a Unix socket in a
-temp dir for the seat transport — from the **same handler**, so the two paths are
+Stdlib `unittest`, no external deps. They stand up **two fake bridges** — one on
+a random localhost port for the grant transport, one on a Unix socket in a temp
+dir for the seat transport — from the **same handler**, so the two paths are
 compared against one server behaviour rather than two fixtures that could drift.
 They need **neither the real bridge nor any real credential**, and they never read
 the master key's env file: that file is refused now, and the refusal has tests.
 
 Coverage includes: the initialize handshake and version negotiation; `tools/list`
-returning exactly seven tools with the right schemas (and *no* `order` field);
-the seat socket sending its header and **no** `Authorization`; both transports
-refusing a 3xx; transport refusal for none / both / env-file; the bidirectional
-result-type pin; the three new doors' forwarded arguments and coverage lines;
-`unmeasured` never rendering as `0`;
+returning every door in the table above with the right schemas (and *no* `order`
+field); the seat socket sending its header and **no** `Authorization`; both
+transports refusing a 3xx; transport refusal for none / both / env-file; the
+bidirectional result-type pin; the new doors' forwarded arguments and coverage
+lines; `unmeasured` never rendering as `0`;
 `order=relevance` present in the forwarded recall body even when the caller tries
 to override it; limit clamping; truncation firing with its marker; the allowlist
 refusing write tools (tested on the internal function directly, and over the

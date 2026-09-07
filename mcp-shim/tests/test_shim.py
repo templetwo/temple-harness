@@ -807,16 +807,30 @@ class TestReadOnlyBoundary(unittest.TestCase):
         self.assertEqual(shim.ALLOWED_BRIDGE_PATHS, frozenset({"/api/heartbeat"}))
         self.assertEqual(len(shim.BRIDGE_TARGETS), 7)
 
-    def test_every_allowlisted_tool_is_classified_by_result_type(self):
-        """An unclassified addition is a red suite, not an unguarded door.
+    def test_the_result_type_split_is_derived_from_the_one_allowlist(self):
+        """There is ONE widening constant for the POST lane, and this proves it.
 
-        The type guard is bidirectional (a string where an object is expected is
-        the bridge fail-open; an object where text is expected is a changed tool
-        shape), so a name in neither set would be reachable by neither door — and
-        a name in BOTH would be checked by whichever helper ran first.
+        `json_result_tools()` is computed from ALLOWED_BRIDGE_TOOLS at call time,
+        so the partition is total and disjoint BY CONSTRUCTION rather than by two
+        constants a future edit could let drift apart — and, the reason it is
+        written this way, widening the allowlist alone changes behaviour. A
+        second frozenset would have stood in front of the first and made law 3's
+        negative control (mutate the constant, watch the suite go red) come back
+        green while the boundary was in fact untested. See
+        tests/test_canary.py::test_allowlist_is_the_write_refusal_gate.
         """
-        self.assertEqual(shim.TEXT_RESULT_TOOLS | shim.JSON_RESULT_TOOLS, shim.ALLOWED_BRIDGE_TOOLS)
-        self.assertEqual(shim.TEXT_RESULT_TOOLS & shim.JSON_RESULT_TOOLS, frozenset())
+        self.assertEqual(shim.TEXT_RESULT_TOOLS | shim.json_result_tools(), shim.ALLOWED_BRIDGE_TOOLS)
+        self.assertEqual(shim.TEXT_RESULT_TOOLS & shim.json_result_tools(), frozenset())
+        self.assertTrue(shim.TEXT_RESULT_TOOLS <= shim.ALLOWED_BRIDGE_TOOLS)
+
+        # The derivation tracks the allowlist rather than a remembered copy.
+        saved = shim.ALLOWED_BRIDGE_TOOLS
+        try:
+            shim.ALLOWED_BRIDGE_TOOLS = saved | frozenset({"canary_probe"})
+            self.assertIn("canary_probe", shim.json_result_tools())
+        finally:
+            shim.ALLOWED_BRIDGE_TOOLS = saved
+        self.assertNotIn("canary_probe", shim.json_result_tools())
 
     def test_json_and_text_doors_refuse_each_other(self):
         with self.assertRaises(shim.BridgeToolNotAllowed):

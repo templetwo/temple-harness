@@ -7,9 +7,9 @@ that gives dsh-driven local models read access to the Sovereign Stack chronicle.
 ## Layout
 
 - `skills/` — SKILL.md skills distilled from the chronicle's standing lessons.
-  Identical format across harnesses (proven 2026-08-23: dsh auto-discovers
-  Claude Code SKILL.md files). Sync this directory to any seat; point both
-  harnesses at it.
+  Identical format across harnesses. Observed 2026-08-23: dsh auto-discovers
+  Claude Code SKILL.md files (no receipt is checked in here). Sync this
+  directory to any seat; point both harnesses at it.
   - `verify-before-declaring` · `receipts-discipline` · `supersession-ethic` · `register-matching`
 - `mcp-shim/` — a thin local MCP (stdio) server wrapping the Sovereign Stack's
   REST bridge, read-only scope, so any local model running under dsh gains
@@ -32,12 +32,13 @@ that gives dsh-driven local models read access to the Sovereign Stack chronicle.
 
 ## Boundaries
 
-The shim is **read-only by design**: recall, latest, open threads, arrival,
-standing policies, unacked signals, heartbeat. The write lane (record_insight
-etc.) stays with gated seats; whether local models ever get write scope is
-Anthony's ruling, untaken. The seat socket makes a Studio-side write lane
-technically available — a seated terminal reaches the stack's write tools with
-no credential at all — and the ruling is still his. Steps 3–4 of the
+The shim is **read-only by design** — the doors are named, not counted, because
+a count rots (`stack_recall`, `stack_latest`, `stack_open_threads`,
+`stack_arrive`, `stack_policies`, `stack_signals`, `stack_heartbeat`). The write
+lane (record_insight etc.) stays with gated seats; whether local models ever get
+write scope is Anthony's ruling, untaken. The seat socket makes a Studio-side
+write lane technically available — a seated terminal reaches the stack's write
+tools with no credential at all — and the ruling is still his. Steps 3–4 of the
 personalization ladder (imatrix requant, LoRA on the relational archive) are
 likewise unruled and out of scope here.
 

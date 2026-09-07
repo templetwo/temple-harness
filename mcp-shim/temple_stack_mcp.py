@@ -114,7 +114,9 @@ BUCKET_MAX = 20
 # --------------------------------------------------------------------------
 # THE READ-ONLY BOUNDARY
 #
-# BRIDGE_TARGETS is the whole surface. Seven MCP tools, five bridge targets,
+# BRIDGE_TARGETS is the whole surface. Seven MCP tools, seven doors, five
+# allowlisted POST targets (`recall_insights`, `get_open_threads`,
+# `arrive_lineage`, `current_policies`, `signals_summary`) and one GET path,
 # nothing else reachable. ALLOWED_BRIDGE_TOOLS is the enforcement point for the
 # POST /api/call lane — the post helper refuses any name outside it BEFORE it
 # builds a request, so a bug elsewhere cannot widen the scope by accident.
@@ -163,11 +165,27 @@ ALLOWED_BRIDGE_PATHS = frozenset({"/api/heartbeat"})
 #     under us, and is refused too. Without this half, a text renderer would
 #     stringify a dict and print plausible garbage.
 #
-# Every allowlisted POST name must be classified, and the classification is
-# checked by test rather than trusted: an unclassified addition is a red suite,
-# not a silently unguarded door.
+# ⚠ THE CLASSIFICATION IS DERIVED, AND THAT IS LOAD-BEARING, NOT TIDINESS.
+#
+# `TEXT_RESULT_TOOLS` names the prose doors; everything else in the allowlist is
+# an object door, computed at call time. Written as a SECOND frozenset it would
+# be a second gate standing in front of the first — and then widening
+# ALLOWED_BRIDGE_TOOLS alone would change nothing, so a reviewer performing law
+# 3's negative control (mutate the constant, watch the suite go red) would watch
+# it stay green and conclude the allowlist was not load-bearing. The canary
+# `tests/test_canary.py::test_allowlist_is_the_write_refusal_gate` performs
+# exactly that mutation. ONE constant widens the POST lane; this one only says
+# how to read what comes back.
+#
+# The safe direction is the default: a new door added to the allowlist and NOT
+# named here is treated as an object door, so a prose result arrives as a string
+# where an object is required and is refused loudly.
 TEXT_RESULT_TOOLS = frozenset({"arrive_lineage", "current_policies"})
-JSON_RESULT_TOOLS = frozenset({"recall_insights", "get_open_threads", "signals_summary"})
+
+
+def json_result_tools() -> frozenset:
+    """Allowlisted POST names whose `result` is an OBJECT. Derived, per call."""
+    return frozenset(ALLOWED_BRIDGE_TOOLS) - TEXT_RESULT_TOOLS
 
 
 class BridgeToolNotAllowed(Exception):
@@ -535,10 +553,10 @@ def bridge_call(bridge_tool: str, arguments: dict | None = None, *, transport=No
     Every tool in JSON_RESULT_TOOLS returns an object; a string here is
     therefore an error wearing a success costume.
     """
-    if bridge_tool not in JSON_RESULT_TOOLS:
+    if bridge_tool not in json_result_tools():
         raise BridgeToolNotAllowed(
             f"refused: '{bridge_tool}' is not a JSON-result door "
-            f"({', '.join(sorted(JSON_RESULT_TOOLS))}); use bridge_call_text if it renders prose."
+            f"({', '.join(sorted(json_result_tools()))}); use bridge_call_text if it renders prose."
         )
     data = _post_envelope(bridge_tool, arguments, transport=transport, timeout=timeout)
     result = data.get("result")
@@ -1267,7 +1285,7 @@ def dump_config() -> str:
         method, target = BRIDGE_TARGETS[name]
         lines.append(f"  {name} -> {method} {target}")
     lines.append(f"allowlisted POST tools: {', '.join(sorted(ALLOWED_BRIDGE_TOOLS))}")
-    lines.append(f"  object-result doors: {', '.join(sorted(JSON_RESULT_TOOLS))}")
+    lines.append(f"  object-result doors: {', '.join(sorted(json_result_tools()))}")
     lines.append(f"  text-result doors: {', '.join(sorted(TEXT_RESULT_TOOLS))}")
     lines.append(f"allowlisted GET paths: {', '.join(sorted(ALLOWED_BRIDGE_PATHS))}")
     lines.append("write lane: none (read-only by construction; widening requires a reviewed diff)")

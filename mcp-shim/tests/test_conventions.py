@@ -178,7 +178,7 @@ class TestBoundaryIsADiff(unittest.TestCase):
         writes = {"record_insight", "record_open_thread", "handoff", "close_session",
                   "spiral_inherit", "reflection_ack", "set_policy", "signal_ack"}
         self.assertEqual(shim.ALLOWED_BRIDGE_TOOLS & writes, frozenset())
-        self.assertEqual((shim.TEXT_RESULT_TOOLS | shim.JSON_RESULT_TOOLS) & writes, frozenset())
+        self.assertEqual((shim.TEXT_RESULT_TOOLS | shim.json_result_tools()) & writes, frozenset())
 
 
 if __name__ == "__main__":
