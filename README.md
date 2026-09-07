@@ -13,9 +13,12 @@ that gives dsh-driven local models read access to the Sovereign Stack chronicle.
   - `verify-before-declaring` · `receipts-discipline` · `supersession-ethic` · `register-matching`
 - `mcp-shim/` — a thin local MCP (stdio) server wrapping the Sovereign Stack's
   REST bridge, read-only scope, so any local model running under dsh gains
-  chronicle recall. Personalization through shared memory, not changed weights.
-  `--dump-config` prints the fully resolved configuration (doors, allowlists,
-  token presence — never the value) without serving.
+  chronicle recall, arrival, standing law and the unacked watch queue.
+  Personalization through shared memory, not changed weights. Two transports,
+  chosen by configuration and never guessed: the Studio seat socket (no
+  credential at all) or a scoped grant. It never carries the master key.
+  `--dump-config` prints the fully resolved configuration (transport and why,
+  doors, allowlists — never a value) without serving.
 - `log-distill/` — a single-file reader for dsh's append-only session event
   logs (JSONL/zstd). Distills a session into a legible summary with anomaly
   flags for the failure modes this house has diagnosed by hand
@@ -29,8 +32,16 @@ that gives dsh-driven local models read access to the Sovereign Stack chronicle.
 
 ## Boundaries
 
-The shim is **read-only by design**: recall, open threads, heartbeat. The write
-lane (record_insight etc.) stays with gated seats; whether local models ever get
-write scope is Anthony's ruling, untaken. Steps 3–4 of the personalization
-ladder (imatrix requant, LoRA on the relational archive) are likewise unruled
-and out of scope here.
+The shim is **read-only by design**: recall, latest, open threads, arrival,
+standing policies, unacked signals, heartbeat. The write lane (record_insight
+etc.) stays with gated seats; whether local models ever get write scope is
+Anthony's ruling, untaken. The seat socket makes a Studio-side write lane
+technically available — a seated terminal reaches the stack's write tools with
+no credential at all — and the ruling is still his. Steps 3–4 of the
+personalization ladder (imatrix requant, LoRA on the relational archive) are
+likewise unruled and out of scope here.
+
+The shim also **never carries the master bridge key**. Anthony's rule of
+2026-09-05: inside the Studio, seats he seated use no tokens; outside it, a seat
+asks for a scoped grant. The env-file fallback that loaded that key by default is
+removed, and the variable that named it is refused rather than ignored.
