@@ -105,11 +105,16 @@ ENV_FILE_VAR = "TEMPLE_BRIDGE_ENV_FILE"
 LIMIT_DEFAULT = 5
 LIMIT_MAX = 10
 
-# stack_arrive's per-bucket cap. The stack accepts 1..100 and REFUSES anything
-# outside that (it does not clamp), so this shim's own ceiling stays well inside
-# the stack's and clamps rather than refuses — consistent with `limit`.
+# stack_arrive's per-bucket ceiling. The stack accepts 1..100 and REFUSES
+# anything outside that in its own words, because "a clamped request reads as an
+# honoured one" — so this shim refuses too, rather than quietly editing the ask.
 BUCKET_DEFAULT = 5
 BUCKET_MAX = 20
+
+# The open thread that tracks the one asymmetry stack_arrive cannot close from
+# here. Named as a constant so the tool description, the coverage line and the
+# docs cannot drift apart on it.
+PROTECTED_RESIDUAL_THREAD = "thread_20260906_163418_a19759f8"
 
 # --------------------------------------------------------------------------
 # THE READ-ONLY BOUNDARY
@@ -644,6 +649,56 @@ def _clamp_limit(value, default: int = LIMIT_DEFAULT, maximum: int = LIMIT_MAX) 
     return max(1, min(maximum, number))
 
 
+def _asked_limit(value):
+    """The number the CALLER asked for, or None if it asked for nothing usable.
+
+    Kept separate from `_clamp_limit` so the clamp can be REPORTED. A clamped
+    request that prints only the ceiling reads as an honoured one — the caller
+    asked for 500, got 10, and nothing in the result says a ceiling was applied.
+    That is the house's own fail-open shape (completeness reported on a narrowed
+    read), one layer in from where it usually hides.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ask_clause(asked, served: int, maximum: int) -> str:
+    """State the ceiling only when it actually bit. Silence when it did not."""
+    if asked is None or asked == served:
+        return ""
+    return f" (asked {asked}, served {served}; this shim's max is {maximum})"
+
+
+def _refuse_out_of_range(name: str, value, minimum: int, maximum: int) -> int:
+    """REFUSE an out-of-range argument; never clamp it.
+
+    This mirrors the stack door's own contract for arrive_lineage, which refuses
+    1..100 violations in its own words because "a clamped request reads as an
+    honoured one". Where a caller can be told exactly what it asked for and what
+    the ceiling is, refusing is the honest answer and clamping is a quiet edit of
+    someone else's request.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a whole number between {minimum} and {maximum}, not a boolean")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a whole number between {minimum} and {maximum}; got {value!r}"
+        ) from None
+    if number < minimum or number > maximum:
+        raise ValueError(
+            f"{name} was {number}, and this shim's range is {minimum}-{maximum}. "
+            "Refused rather than clamped: a clamped request reads as an honoured one. "
+            f"Ask again with {name} <= {maximum}."
+        )
+    return number
+
+
 def _short_ts(value) -> str:
     text = str(value or "").strip()
     return text[:19] if len(text) > 19 else text or "(no timestamp)"
@@ -702,12 +757,12 @@ def _insight_blocks(items: list) -> list:
     return blocks
 
 
-def render_recall(result: dict, query: str, domain: str | None, limit: int) -> str:
+def render_recall(result: dict, query: str, domain: str | None, limit: int, asked=None) -> str:
     items = result.get("items") or []
     header = [
         f'Sovereign Stack recall — query: "{query}"'
         + (f' | domain: "{domain}"' if domain else " | domain: (all)")
-        + f" | limit: {limit} | order: relevance",
+        + f" | limit: {limit}{_ask_clause(asked, limit, LIMIT_MAX)} | order: relevance",
         _coverage_line(result),
     ]
     if not items:
@@ -717,12 +772,12 @@ def render_recall(result: dict, query: str, domain: str | None, limit: int) -> s
     return "\n".join(header) + "\n\n" + "\n\n".join(_insight_blocks(items))
 
 
-def render_latest(result: dict, domain: str | None, limit: int) -> str:
+def render_latest(result: dict, domain: str | None, limit: int, asked=None) -> str:
     items = result.get("items") or []
     header = [
         f"Sovereign Stack latest — the {limit} newest chronicle entries"
         + (f' | domain: "{domain}"' if domain else " | domain: (all)")
-        + " | order: newest",
+        + f"{_ask_clause(asked, limit, LIMIT_MAX)} | order: newest",
         _coverage_line(result),
     ]
     if not items:
@@ -732,9 +787,13 @@ def render_latest(result: dict, domain: str | None, limit: int) -> str:
     return "\n".join(header) + "\n\n" + "\n\n".join(_insight_blocks(items))
 
 
-def render_open_threads(result: dict, limit: int) -> str:
+def render_open_threads(result: dict, limit: int, asked=None) -> str:
     items = result.get("items") or []
-    header = [f"Sovereign Stack open threads — limit: {limit}", _coverage_line(result)]
+    header = [
+        f"Sovereign Stack open threads — limit: {limit}"
+        + _ask_clause(asked, limit, LIMIT_MAX),
+        _coverage_line(result),
+    ]
     if not items:
         header.append("")
         header.append("No open threads.")
@@ -789,6 +848,17 @@ def render_arrival(text: str, reader: str, bucket_limit: int, transport) -> str:
             f"seat transport: the bridge OVERRODE source_instance with the verified seat id "
             f"\"{transport.seat}\", so to_self letters were filtered for that seat id, NOT for "
             f"\"{reader}\". An empty to_self bucket here is not evidence of no mail."
+        )
+        lines.append(
+            "protected material: on this transport the bridge WITHHOLDS designated protected "
+            "records — structurally and by text redaction — before the payload reaches here."
+        )
+    else:
+        lines.append(
+            "protected material: on a scoped-grant transport the bridge does NOT withhold "
+            "designated protected records; whatever the grant reaches, the caller reads, under "
+            f"the consent gate's own terms. That asymmetry is open thread "
+            f"{PROTECTED_RESIDUAL_THREAD} at Anthony's gate — stated here, not blocked on."
         )
     return "\n".join(lines) + "\n\n" + text.strip()
 
@@ -966,7 +1036,9 @@ TOOL_DEFINITIONS = [
             "spiral status, letters from past instances, and the self-model. Use this "
             "ONLY to orient at the beginning — for a topical question use stack_recall, "
             "for what happened recently use stack_latest. It takes no query and "
-            "consumes nothing. Read-only. Coverage is stated in every result."
+            "consumes nothing. Protected records are withheld by the bridge on the seat "
+            "transport and NOT on a scoped grant; the result says which. Read-only. "
+            "Coverage is stated in every result."
         ),
         "inputSchema": {
             "type": "object",
@@ -1028,6 +1100,7 @@ def call_tool(name: str, arguments: dict) -> str:
             raise ValueError("stack_recall requires a non-empty 'query' string")
         domain = arguments.get("domain")
         domain = domain.strip() if isinstance(domain, str) and domain.strip() else None
+        asked = _asked_limit(arguments.get("limit"))
         limit = _clamp_limit(arguments.get("limit"))
         # order is NOT taken from arguments and is NOT in the input schema:
         # relevance is pinned so a caller cannot fall back into recency noise.
@@ -1035,7 +1108,7 @@ def call_tool(name: str, arguments: dict) -> str:
         if domain:
             forwarded["domain"] = domain
         result = bridge_call("recall_insights", forwarded)
-        return render_recall(result, query.strip(), domain, limit)
+        return render_recall(result, query.strip(), domain, limit, asked)
 
     if name == "stack_latest":
         # The groove-guard, enforced server-side and not just in the schema: a
@@ -1047,6 +1120,7 @@ def call_tool(name: str, arguments: dict) -> str:
             )
         domain = arguments.get("domain")
         domain = domain.strip() if isinstance(domain, str) and domain.strip() else None
+        asked = _asked_limit(arguments.get("limit"))
         limit = _clamp_limit(arguments.get("limit"))
         # order is pinned to newest and is NOT in the input schema; this door has
         # no search terms, so newest-first here is a tail read, not the
@@ -1055,12 +1129,13 @@ def call_tool(name: str, arguments: dict) -> str:
         if domain:
             forwarded["domain"] = domain
         result = bridge_call("recall_insights", forwarded)
-        return render_latest(result, domain, limit)
+        return render_latest(result, domain, limit, asked)
 
     if name == "stack_open_threads":
+        asked = _asked_limit(arguments.get("limit"))
         limit = _clamp_limit(arguments.get("limit"))
         result = bridge_call("get_open_threads", {"limit": limit})
-        return render_open_threads(result, limit)
+        return render_open_threads(result, limit, asked)
 
     if name == "stack_arrive":
         # The reader name is CONFIGURATION, not an argument: it must be the bare
@@ -1081,7 +1156,16 @@ def call_tool(name: str, arguments: dict) -> str:
                 "to_self addressee filter matches the BARE model name only, so a decorated "
                 "name hides that line's letters. Use the model name alone."
             )
-        bucket = _clamp_limit(arguments.get("limit_per_bucket"), BUCKET_DEFAULT, BUCKET_MAX)
+        # REFUSED, NOT CLAMPED — the stack door this wraps refuses 1..100
+        # violations for exactly this reason, and a wrapper that quietly clamps
+        # would put the honoured-request illusion back one layer out.
+        bucket = (
+            BUCKET_DEFAULT
+            if arguments.get("limit_per_bucket") is None
+            else _refuse_out_of_range(
+                "limit_per_bucket", arguments["limit_per_bucket"], 1, BUCKET_MAX
+            )
+        )
         transport = resolve_transport()
         text = bridge_call_text(
             "arrive_lineage",

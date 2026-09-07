@@ -74,6 +74,26 @@ refusal stops firing when its variable name is pointed elsewhere.
 string identifies harness traffic in bridge logs; a grep pinned to
 `temple-stack/0.3.1` goes blind on this release.
 
+### review items from the claude.ai web seat (relayed by Anthony)
+
+- **The silent clamp is closed.** `stack_arrive` now REFUSES `limit_per_bucket`
+  outside 1-20 and names both the ceiling and the value asked, mirroring the
+  stack door it wraps — `arrive_lineage` refuses 1..100 violations in its own
+  words because *"a clamped request reads as an honoured one"*, and a wrapper
+  that clamped would reinstate that illusion one layer out while printing only
+  the ceiling. `stack_recall` / `stack_latest` / `stack_open_threads` keep
+  clamping `limit` (that behaviour predates this branch and other seats build on
+  it), but the coverage line now says `asked 500, served 10; this shim's max is
+  10` whenever the ceiling bit, and says nothing when it did not.
+- **The protected-material asymmetry is STATED, not blocked on.** `stack_arrive`
+  reads with `full_content: true`. On the **seat** transport the bridge withholds
+  designated protected records structurally and by text redaction before the
+  payload reaches this shim. On a **scoped-grant** transport it does not: whatever
+  the grant reaches, the caller reads, under the consent gate's own terms. The
+  door prints which of the two applies, the tool description says so in one
+  sentence, and both cite open thread `thread_20260906_163418_a19759f8`, which is
+  at Anthony's gate. No behaviour was gated on it here.
+
 ### reconcile with main (PRs #5 and #6, MacBook seat, same night)
 
 - **PR #5's canary** (`mcp-shim/tests/test_canary.py`) drives the real gates now.

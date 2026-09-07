@@ -1365,17 +1365,48 @@ class TestNewDoors(ShimTestCase):
 
     # -- stack_arrive --------------------------------------------------------
 
-    def test_arrive_forwards_the_reader_full_content_and_a_clamped_bucket(self):
+    def test_arrive_forwards_the_reader_full_content_and_an_in_range_bucket(self):
         STATE.payload_by_tool = {"arrive_lineage": FAKE_ARRIVAL_TEXT}
         proc = self.spawn()
         proc.handshake()
-        response = self.call(proc, "stack_arrive", {"limit_per_bucket": 500})
+        response = self.call(proc, "stack_arrive", {"limit_per_bucket": 12})
         self.assertFalse(response["result"]["isError"], self.text_of(response))
         forwarded = STATE.calls[0]
         self.assertEqual(forwarded["tool"], "arrive_lineage")
         self.assertEqual(forwarded["arguments"]["source_instance"], DUMMY_SEAT_NAME)
         self.assertIs(forwarded["arguments"]["full_content"], True)
-        self.assertEqual(forwarded["arguments"]["limit_per_bucket"], shim.BUCKET_MAX)
+        # An in-range ask is passed through UNTOUCHED — no ceiling, no edit.
+        self.assertEqual(forwarded["arguments"]["limit_per_bucket"], 12)
+
+    def test_arrive_refuses_an_over_ceiling_bucket_naming_both_numbers(self):
+        """REFUSED, not clamped — the stack door's own contract, mirrored.
+
+        arrive_lineage refuses 1..100 violations rather than clamping, in its own
+        words because "a clamped request reads as an honoured one". A wrapper that
+        clamped would reinstate exactly that illusion one layer out, and print only
+        the ceiling, so the caller could never see that its ask was edited.
+        """
+        STATE.payload_by_tool = {"arrive_lineage": FAKE_ARRIVAL_TEXT}
+        proc = self.spawn()
+        proc.handshake()
+        response = self.call(proc, "stack_arrive", {"limit_per_bucket": 500})
+        self.assertTrue(response["result"]["isError"])
+        text = self.text_of(response)
+        self.assertIn("500", text, "the refusal must name what was ASKED")
+        self.assertIn(str(shim.BUCKET_MAX), text, "the refusal must name the ceiling")
+        self.assertIn("Refused rather than clamped", text)
+        self.assertEqual(STATE.calls, [], "a refused ask must not reach the bridge")
+
+    def test_arrive_refuses_a_zero_or_negative_bucket(self):
+        proc = self.spawn()
+        proc.handshake()
+        for value in (0, -3):
+            with self.subTest(limit_per_bucket=value):
+                STATE.reset()
+                response = self.call(proc, "stack_arrive", {"limit_per_bucket": value})
+                self.assertTrue(response["result"]["isError"])
+                self.assertEqual(STATE.calls, [])
+
 
     def test_arrive_renders_the_doors_own_text_under_a_coverage_line(self):
         STATE.payload_by_tool = {"arrive_lineage": FAKE_ARRIVAL_TEXT}
@@ -1404,6 +1435,7 @@ class TestNewDoors(ShimTestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertIn("decorated", self.text_of(response))
         self.assertEqual(STATE.calls, [])
+
 
     # -- stack_policies ------------------------------------------------------
 
@@ -1508,6 +1540,56 @@ class TestNewDoors(ShimTestCase):
         self.assertIn("signal_ledger_unavailable", text)
 
 
+class TestClampIsStated(ShimTestCase):
+    """A clamped limit that prints only the ceiling reads as an honoured ask.
+
+    stack_recall / stack_latest / stack_open_threads keep clamping (that is the
+    behaviour the four-door shim shipped and other seats build on), so the
+    coverage line has to SAY the ceiling bit: asked N, served M. Silence there is
+    the same fail-open shape as a partial read that reports completeness.
+    """
+
+    def call(self, proc, name, arguments):
+        return proc.request({
+            "jsonrpc": "2.0", "id": 60, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        })
+
+    def test_each_clamping_door_states_the_ask_and_what_was_served(self):
+        for name, arguments in (
+            ("stack_recall", {"query": "anything", "limit": 500}),
+            ("stack_latest", {"limit": 500}),
+            ("stack_open_threads", {"limit": 500}),
+        ):
+            with self.subTest(tool=name):
+                STATE.reset()
+                STATE.payload_by_tool = {"get_open_threads": default_threads_result()}
+                proc = self.spawn()
+                proc.handshake()
+                response = self.call(proc, name, arguments)
+                self.assertFalse(response["result"]["isError"], self.text_of(response))
+                text = self.text_of(response)
+                self.assertIn("asked 500", text)
+                self.assertIn(f"served {shim.LIMIT_MAX}", text)
+                # And the ceiling is what actually went to the bridge.
+                self.assertEqual(STATE.calls[0]["arguments"]["limit"], shim.LIMIT_MAX)
+
+    def test_an_in_range_limit_prints_no_ceiling_clause(self):
+        STATE.payload_by_tool = {}
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_recall", {"query": "x", "limit": 3}))
+        self.assertIn("limit: 3", text)
+        self.assertNotIn("asked", text)
+        self.assertEqual(STATE.calls[0]["arguments"]["limit"], 3)
+
+    def test_an_absent_limit_prints_no_ceiling_clause(self):
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_recall", {"query": "x"}))
+        self.assertIn(f"limit: {shim.LIMIT_DEFAULT}", text)
+        self.assertNotIn("asked", text)
+
 class TestNewDoorTruncation(ShimTestCase):
     def test_arrival_truncation_states_both_numbers_and_keeps_the_coverage_line(self):
         """Two truncations, kept distinguishable — and coverage survives the cut.
@@ -1558,6 +1640,24 @@ class TestArrivalOverrideIsStated(unittest.TestCase):
         text = shim.render_arrival("body", "claude-fable-5", 5, grant_transport("http://x"))
         self.assertNotIn("OVERRODE", text)
         self.assertIn("arrival coverage:", text)
+
+    def test_the_protected_asymmetry_is_stated_on_both_transports(self):
+        """State it, do not block on it — and never state the same thing twice.
+
+        On the seat transport the bridge withholds designated protected records
+        structurally and by redaction. On a scoped grant it does not, and the
+        caller reads under the consent gate's own terms. That residual is an open
+        thread at Anthony's gate, so the door names the thread rather than
+        pretending the two transports are equivalent.
+        """
+        seat = shim.render_arrival("body", "claude-fable-5", 5, seat_transport("/tmp/x.sock"))
+        self.assertIn("protected material:", seat)
+        self.assertIn("WITHHOLDS", seat)
+
+        grant = shim.render_arrival("body", "claude-fable-5", 5, grant_transport("http://x"))
+        self.assertIn("protected material:", grant)
+        self.assertIn("does NOT withhold", grant)
+        self.assertIn(shim.PROTECTED_RESIDUAL_THREAD, grant)
 
 
 class TestDumpConfigTransport(unittest.TestCase):
