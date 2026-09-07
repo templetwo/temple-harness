@@ -97,3 +97,36 @@ Enforced: `RedactionTests` in the log-distill suite — redaction fires at the
 funnel, survives clipping, and is proven load-bearing (empty the patterns
 and a probe leaks, so the gate is real, not incidental). (HQ amendment,
 2026-08-24, from a live incident on the Studio.)
+
+## 8. The landing path is written, not customary
+
+Every change to this repo arrives as a pull request against `main`. The ten
+commits that went straight in are history, not precedent; PR #1 is where
+that ends.
+
+Two tiers. A change lands on green CI plus one second-seat review, with no
+tap, unless it touches the second tier. The second tier takes Anthony's tap
+regardless of what CI says: the redaction funnel and its pattern list, the
+credential path (token loading, bridge transport, the law-3 scope
+constants), and this file.
+
+Green means the workflow ran on the head being merged, not on an ancestor.
+A badge is a statement about a branch; read the run's head sha.
+
+Green is a floor, not a reading. CI cannot see a check that was removed —
+at `cd65d36` the restore-half assertion of `test_funnel_is_load_bearing`
+was dropped and the suite stayed green, and that assertion is law 7's
+stated enforcement. The second seat reads the tests as changed code, not
+only the code under test, and applies law 3's negative control by hand
+until a canary does it.
+
+Branches are named by intent (`fix/`, `feat/`, `docs/`); seat-prefixed
+names are retired. A branch is deleted when its PR merges. A merged branch
+left standing claims the work is unfinished.
+
+Enforced: partly, and the gap is the point. `run-tests.sh` runs under
+GitHub Actions on 3.10, 3.11, and 3.12 for every push and pull request.
+**Not enforced:** nothing requires that check to pass before a merge, and
+nothing requires a second seat. Both are observed, not enforced. Per the
+preamble, that is listed honestly here rather than implied away, and
+closing it is the first work this law asks for.
