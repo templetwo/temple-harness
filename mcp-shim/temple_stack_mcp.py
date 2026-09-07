@@ -76,7 +76,8 @@ LIMIT_MAX = 10
 # --------------------------------------------------------------------------
 # THE READ-ONLY BOUNDARY
 #
-# BRIDGE_TARGETS is the whole surface. Three MCP tools, three bridge targets,
+# BRIDGE_TARGETS is the whole surface. Four MCP tools, four doors, two allowlisted
+# POST targets (`recall_insights`, `get_open_threads`) and one GET path,
 # nothing else reachable. ALLOWED_BRIDGE_TOOLS is the enforcement point for the
 # POST /api/call lane — bridge_call() refuses any name outside it BEFORE it
 # builds a request, so a bug elsewhere cannot widen the scope by accident.

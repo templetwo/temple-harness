@@ -12,18 +12,18 @@ can drive it.
 - **One file**, `temple_stack_mcp.py`, executable.
 - **Stdlib only** (`urllib`, `json`, `sys`, `os`). No pip, no venv, no wheels.
   It runs anywhere `python3` exists.
-- Verified on Python 3.14.5 (the Mac Studio's Homebrew `python3`); written
-  against 3.12+ syntax.
+- Verified on Python 3.14.x (Studio) and 3.11 (this seat); syntax floor 3.10.
 
 ## The read-only boundary, and why
 
-The shim exposes **exactly three tools, all reads**, and there is **no
+The shim exposes **exactly four tools, all reads**, and there is **no
 pass-through tool** — a caller cannot name a bridge tool, it can only pick one of
-three doors that were opened for it.
+four doors that were opened for it.
 
 | MCP tool | Bridge target | Method |
 |---|---|---|
 | `stack_recall` | `recall_insights` | POST `/api/call` |
+| `stack_latest` | `recall_insights` (same allowlist; order=newest, no query) | POST `/api/call` |
 | `stack_open_threads` | `get_open_threads` | POST `/api/call` |
 | `stack_heartbeat` | `/api/heartbeat` | GET (no auth) |
 
@@ -166,12 +166,12 @@ cd mcp-shim
 python3 -m unittest discover -s tests -v
 ```
 
-38 tests, stdlib `unittest`, no external deps. They stand up a **fake bridge** on
+Stdlib `unittest`, no external deps. They stand up a **fake bridge** on
 a random localhost port and point the shim at it via `TEMPLE_BRIDGE_URL`, so they
 need **neither the real bridge nor the real token**.
 
 Coverage includes: the initialize handshake and version negotiation; `tools/list`
-returning exactly three tools with the right schemas (and *no* `order` field);
+returning exactly four tools with the right schemas (and *no* `order` field);
 `order=relevance` present in the forwarded recall body even when the caller tries
 to override it; limit clamping; truncation firing with its marker; the allowlist
 refusing write tools (tested on the internal function directly, and over the
