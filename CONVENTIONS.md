@@ -124,9 +124,12 @@ Branches are named by intent (`fix/`, `feat/`, `docs/`); seat-prefixed
 names are retired. A branch is deleted when its PR merges. A merged branch
 left standing claims the work is unfinished.
 
-Enforced: partly, and the gap is the point. `run-tests.sh` runs under
-GitHub Actions on 3.10, 3.11, and 3.12 for every push and pull request.
-**Not enforced:** nothing requires that check to pass before a merge, and
-nothing requires a second seat. Both are observed, not enforced. Per the
-preamble, that is listed honestly here rather than implied away, and
-closing it is the first work this law asks for.
+Enforced: `run-tests.sh` runs under GitHub Actions on 3.10, 3.11, and
+3.12 for every push and pull request. A ruleset on `main`
+(`law-8-main-landing-path`) requires those checks to pass on the head
+being merged (`strict`: not an ancestor), requires a pull request, and
+refuses force-push and deletion. Direct pushes to `main` are refused.
+**Not enforced:** a second seat. GitHub requires zero approving reviews;
+second-seat review remains observed, off-platform, until a seat has a
+GitHub identity that can satisfy it. That is the remaining work this
+law asks for.
