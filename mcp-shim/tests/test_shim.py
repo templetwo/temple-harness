@@ -656,7 +656,7 @@ class TestToolCalls(ShimTestCase):
         proc.handshake()
         response = self.call(proc, "stack_recall", {"query": "nothing matches this"})
         self.assertFalse(response["result"]["isError"])
-        self.assertIn("No matching chronicle entries.", self.text_of(response))
+        self.assertIn("No entries matched the query in the stated scope.", self.text_of(response))
 
     def test_recall_rejects_empty_query(self):
         proc = self.spawn()
@@ -718,7 +718,7 @@ class TestToolCalls(ShimTestCase):
         proc.handshake()
         response = self.call(proc, "stack_latest", {})
         self.assertFalse(response["result"]["isError"])
-        self.assertIn("No chronicle entries.", self.text_of(response))
+        self.assertIn("No entries matched the query in the stated scope.", self.text_of(response))
 
     def test_open_threads_forwards_and_renders(self):
         STATE.result_payload = default_threads_result()
@@ -741,6 +741,214 @@ class TestToolCalls(ShimTestCase):
         # measurement — the live count is whatever /api/heartbeat says.
         self.assertIn("tools: 52", text)
         self.assertEqual(STATE.calls, [], "heartbeat must not touch POST /api/call")
+
+
+# ---------------------------------------------------------------------------
+# Domain: no-filter spellings, a real miss, partial_reasons, write redirect
+# ---------------------------------------------------------------------------
+
+# Omitted, JSON null, blank, and the reserved no-filter spellings. Each must
+# forward the SAME request with no domain key. Case and surrounding space
+# are part of the contract: a tiny model will not spell them consistently.
+NO_FILTER_DOMAIN_CASES = (
+    ("omitted", {}),
+    ("json_null", {"domain": None}),
+    ("blank", {"domain": "   "}),
+    ("empty", {"domain": ""}),
+    ("none", {"domain": "none"}),
+    ("NONE", {"domain": "NONE"}),
+    ("None_padded", {"domain": " None "}),
+    ("null_word", {"domain": "null"}),
+    ("NULL", {"domain": "NULL"}),
+    ("all", {"domain": "all"}),
+    ("ALL", {"domain": "ALL"}),
+    ("star", {"domain": "*"}),
+)
+
+DOMAIN_MUST_BE_A_STRING = "domain must be a string; omit it for no filter."
+WRITE_REDIRECT = "This shim is read-only; give the text to HQ for an authorized write."
+NO_FILTER_DESCRIPTION_CLAUSE = "none, null, all, and * mean no filter"
+GENERIC_MISS = "No entries matched the query in the stated scope."
+
+
+class TestNoFilterDomain(ShimTestCase):
+    def call(self, proc, name, arguments=None, request_id=3):
+        return proc.request({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        })
+
+    def test_each_no_filter_spelling_forwards_recall_without_a_domain_key(self):
+        proc = self.spawn()
+        proc.handshake()
+        forwarded = []
+        for label, extra in NO_FILTER_DOMAIN_CASES:
+            with self.subTest(spelling=label):
+                STATE.calls.clear()
+                arguments = {"query": "tiny visiting model"}
+                arguments.update(extra)
+                response = self.call(proc, "stack_recall", arguments)
+                self.assertFalse(response["result"]["isError"], self.text_of(response))
+                self.assertEqual(len(STATE.calls), 1)
+                body = STATE.calls[0]
+                self.assertEqual(body["tool"], "recall_insights")
+                self.assertNotIn("domain", body["arguments"])
+                self.assertEqual(body["arguments"]["query"], "tiny visiting model")
+                self.assertEqual(body["arguments"]["order"], "relevance")
+                forwarded.append(body["arguments"])
+        reference = forwarded[0]
+        for index, arguments in enumerate(forwarded[1:], start=1):
+            self.assertEqual(arguments, reference, NO_FILTER_DOMAIN_CASES[index][0])
+
+    def test_each_no_filter_spelling_forwards_latest_without_a_domain_key(self):
+        proc = self.spawn()
+        proc.handshake()
+        forwarded = []
+        for label, extra in NO_FILTER_DOMAIN_CASES:
+            with self.subTest(spelling=label):
+                STATE.calls.clear()
+                response = self.call(proc, "stack_latest", dict(extra))
+                self.assertFalse(response["result"]["isError"], self.text_of(response))
+                self.assertEqual(len(STATE.calls), 1)
+                body = STATE.calls[0]
+                self.assertEqual(body["tool"], "recall_insights")
+                self.assertNotIn("domain", body["arguments"])
+                self.assertNotIn("query", body["arguments"])
+                self.assertEqual(body["arguments"]["order"], "newest")
+                forwarded.append(body["arguments"])
+        reference = forwarded[0]
+        for index, arguments in enumerate(forwarded[1:], start=1):
+            self.assertEqual(arguments, reference, NO_FILTER_DOMAIN_CASES[index][0])
+
+    def test_ordinary_domain_forwards_unchanged_on_both_doors(self):
+        proc = self.spawn()
+        proc.handshake()
+        self.call(proc, "stack_recall", {"query": "x", "domain": "hq-ops"})
+        self.assertEqual(STATE.calls[-1]["arguments"]["domain"], "hq-ops")
+        self.call(proc, "stack_latest", {"domain": "temple-harness"})
+        self.assertEqual(STATE.calls[-1]["arguments"]["domain"], "temple-harness")
+
+    def test_non_string_domain_is_refused_and_dispatches_nothing(self):
+        proc = self.spawn()
+        proc.handshake()
+        for label, value in (("int", 1), ("bool", True), ("list", ["hq-ops"]), ("object", {"x": 1})):
+            with self.subTest(kind=label):
+                STATE.calls.clear()
+                response = self.call(proc, "stack_recall", {"query": "x", "domain": value})
+                self.assertTrue(response["result"]["isError"])
+                self.assertIn(DOMAIN_MUST_BE_A_STRING, self.text_of(response))
+                self.assertEqual(STATE.calls, [])
+                response = self.call(proc, "stack_latest", {"domain": value})
+                self.assertTrue(response["result"]["isError"])
+                self.assertIn(DOMAIN_MUST_BE_A_STRING, self.text_of(response))
+                self.assertEqual(STATE.calls, [])
+
+    def test_normalization_is_stated_on_the_coverage_line(self):
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_recall", {"query": "x", "domain": "none"}))
+        self.assertIn("treated as no filter", text)
+        omitted = self.text_of(self.call(proc, "stack_recall", {"query": "x"}))
+        self.assertNotIn("treated as no filter", omitted)
+
+    def test_descriptions_reserve_the_no_filter_spellings(self):
+        by_name = {tool["name"]: tool for tool in shim.TOOL_DEFINITIONS}
+        for name in ("stack_recall", "stack_latest"):
+            with self.subTest(tool=name):
+                description = by_name[name]["description"]
+                self.assertLessEqual(len(description), 700)
+                self.assertIn(NO_FILTER_DESCRIPTION_CLAUSE, description.lower())
+
+
+class TestDomainEmptyExplanation(ShimTestCase):
+    def call(self, proc, name, arguments=None, request_id=3):
+        return proc.request({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        })
+
+    def test_domain_empty_names_the_counts_when_supplied(self):
+        STATE.result_payload = {
+            "items": [],
+            "returned": 0,
+            "total_matched": 0,
+            "offset": 0,
+            "scope": {
+                "mode": "domain-empty",
+                "domain_query": "does-not-exist-xyz",
+                "domains_searched": 0,
+                "domains_total": 1530,
+            },
+            "truncated": False,
+            "partial_reasons": ["domain-empty"],
+        }
+        proc = self.spawn()
+        proc.handshake()
+        for name, arguments in (
+            ("stack_recall", {"query": "tiny visiting model", "domain": "does-not-exist-xyz"}),
+            ("stack_latest", {"domain": "does-not-exist-xyz"}),
+        ):
+            with self.subTest(tool=name):
+                response = self.call(proc, name, arguments)
+                self.assertFalse(response["result"]["isError"], self.text_of(response))
+                text = self.text_of(response)
+                self.assertIn("No domain matched", text)
+                self.assertIn("domains_searched", text)
+                self.assertIn("domains_total", text)
+                self.assertIn("1530", text)
+
+    def test_domain_empty_without_counts_still_says_no_domain_matched(self):
+        STATE.result_payload = {
+            "items": [],
+            "returned": 0,
+            "total_matched": 0,
+            "scope": {"mode": "domain-empty"},
+            "truncated": False,
+        }
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(
+            proc, "stack_recall",
+            {"query": "tiny visiting model", "domain": "does-not-exist-xyz"},
+        ))
+        self.assertIn("No domain matched", text)
+        self.assertNotIn("domains_searched", text)
+        self.assertNotIn("domains_total", text)
+
+    def test_a_query_miss_in_scope_is_not_called_a_domain_miss(self):
+        STATE.result_payload = default_recall_result(items=[], total=0)
+        proc = self.spawn()
+        proc.handshake()
+        text = self.text_of(self.call(proc, "stack_recall", {"query": "nothing matches this"}))
+        self.assertIn(GENERIC_MISS, text)
+        self.assertNotIn("No domain matched", text)
+        latest = self.text_of(self.call(proc, "stack_latest", {}))
+        self.assertIn(GENERIC_MISS, latest)
+        self.assertNotIn("No domain matched", latest)
+
+
+class TestWriteNameRefusalRedirect(ShimTestCase):
+    def test_write_names_and_unknown_names_redirect_to_hq_and_dispatch_nothing(self):
+        proc = self.spawn()
+        proc.handshake()
+        for name in ("record_insight", "handoff", "not_a_door"):
+            with self.subTest(name=name):
+                STATE.calls.clear()
+                response = proc.request({
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": {"content": "should never land"}},
+                })
+                self.assertTrue(response["result"]["isError"])
+                text = self.text_of(response)
+                self.assertIn("refused", text.lower())
+                self.assertIn(WRITE_REDIRECT, text)
+                self.assertEqual(STATE.calls, [], "a refused tool must not reach the bridge")
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1348,14 @@ class TestHelpers(unittest.TestCase):
 
     def test_coverage_line_survives_a_bare_result(self):
         self.assertIn("returned 0", shim._coverage_line({}))
+
+    def test_partial_reasons_render_when_truncated_is_false(self):
+        result = default_recall_result()
+        result["truncated"] = False
+        result["partial_reasons"] = ["domain-empty"]
+        line = shim._coverage_line(result)
+        self.assertIn("domain-empty", line)
+        self.assertNotIn("bridge-side truncated", line)
 
 
 class TestRedirects(unittest.TestCase):
