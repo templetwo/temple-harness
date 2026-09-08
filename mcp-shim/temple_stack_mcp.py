@@ -714,7 +714,50 @@ def _measured(value) -> str:
     return "unmeasured" if value is None else str(value)
 
 
-def _coverage_line(result: dict) -> str:
+# Reserved no-filter spellings for `domain`. A tiny model invents these; the
+# substrate carries the load. Ordinary labels (including a literal domain that
+# is not exactly one of these, after trim) pass through unchanged.
+_NO_FILTER_DOMAIN_SPELLINGS = frozenset({"none", "null", "all", "*"})
+
+
+def _normalize_domain(arguments: dict) -> tuple[str | None, str | None]:
+    """Return (forwarded domain or None, coverage clause or None).
+
+    Omitted, JSON null, blank, and the reserved spellings none / null / all / *
+    (trimmed, case-insensitive) mean no filter: `domain` is then omitted from
+    the forwarded request. A non-string is refused, never silently widened.
+    """
+    if "domain" not in arguments:
+        return None, None
+    raw = arguments["domain"]
+    if raw is None:
+        return None, "domain null treated as no filter"
+    if not isinstance(raw, str):
+        raise ValueError("domain must be a string; omit it for no filter.")
+    trimmed = raw.strip()
+    if not trimmed:
+        return None, "blank domain treated as no filter"
+    if trimmed.lower() in _NO_FILTER_DOMAIN_SPELLINGS:
+        return None, f'domain "{trimmed}" treated as no filter'
+    return trimmed, None
+
+
+def _empty_scope_line(result: dict) -> str:
+    """Explain a miss. A domain-empty envelope is not 'Anthony never said it'."""
+    scope = result.get("scope")
+    if isinstance(scope, dict) and scope.get("mode") == "domain-empty":
+        bits = []
+        if scope.get("domains_searched") is not None:
+            bits.append(f"domains_searched {scope['domains_searched']}")
+        if scope.get("domains_total") is not None:
+            bits.append(f"domains_total {scope['domains_total']}")
+        if bits:
+            return "No domain matched (" + ", ".join(bits) + ")."
+        return "No domain matched."
+    return "No entries matched the query in the stated scope."
+
+
+def _coverage_line(result: dict, domain_note: str | None = None) -> str:
     """Restate the BRIDGE's own partiality. Distinct from this shim's char cap."""
     returned = result.get("returned")
     if returned is None:
@@ -722,15 +765,19 @@ def _coverage_line(result: dict) -> str:
     total = result.get("total_matched")
     parts = [f"bridge coverage: returned {returned} of {total} matched" if total is not None
              else f"bridge coverage: returned {returned}"]
+    reasons = result.get("partial_reasons") or []
     if result.get("truncated"):
-        reasons = result.get("partial_reasons") or []
         parts.append("bridge-side truncated" + (f" ({', '.join(str(r) for r in reasons)})" if reasons else ""))
+    elif reasons:
+        parts.append("partial reasons: " + ", ".join(str(r) for r in reasons))
     continuation = result.get("continuation")
     if isinstance(continuation, dict) and continuation.get("offset") is not None:
         parts.append(f"more available from offset {continuation['offset']}")
     scope = result.get("scope")
     if isinstance(scope, dict) and scope.get("domains_searched") is not None:
         parts.append(f"domains searched {scope['domains_searched']}/{scope.get('domains_total', '?')}")
+    if domain_note:
+        parts.append(domain_note)
     return " | ".join(parts)
 
 
@@ -757,32 +804,32 @@ def _insight_blocks(items: list) -> list:
     return blocks
 
 
-def render_recall(result: dict, query: str, domain: str | None, limit: int, asked=None) -> str:
+def render_recall(result: dict, query: str, domain: str | None, limit: int, asked=None, domain_note=None) -> str:
     items = result.get("items") or []
     header = [
         f'Sovereign Stack recall — query: "{query}"'
         + (f' | domain: "{domain}"' if domain else " | domain: (all)")
         + f" | limit: {limit}{_ask_clause(asked, limit, LIMIT_MAX)} | order: relevance",
-        _coverage_line(result),
+        _coverage_line(result, domain_note=domain_note),
     ]
     if not items:
         header.append("")
-        header.append("No matching chronicle entries.")
+        header.append(_empty_scope_line(result))
         return "\n".join(header)
     return "\n".join(header) + "\n\n" + "\n\n".join(_insight_blocks(items))
 
 
-def render_latest(result: dict, domain: str | None, limit: int, asked=None) -> str:
+def render_latest(result: dict, domain: str | None, limit: int, asked=None, domain_note=None) -> str:
     items = result.get("items") or []
     header = [
         f"Sovereign Stack latest — the {limit} newest chronicle entries"
         + (f' | domain: "{domain}"' if domain else " | domain: (all)")
         + f"{_ask_clause(asked, limit, LIMIT_MAX)} | order: newest",
-        _coverage_line(result),
+        _coverage_line(result, domain_note=domain_note),
     ]
     if not items:
         header.append("")
-        header.append("No chronicle entries.")
+        header.append(_empty_scope_line(result))
         return "\n".join(header)
     return "\n".join(header) + "\n\n" + "\n\n".join(_insight_blocks(items))
 
@@ -978,8 +1025,9 @@ TOOL_DEFINITIONS = [
             "Read-only. Results are always ordered by RELEVANCE (the bridge default, "
             "'newest', returns recency noise for historical questions — this shim pins "
             "relevance and does not accept an order argument). Matching is keyword-OR "
-            "across the query terms. Coverage (how many of the total matches you are "
-            "seeing) is stated in every result."
+            "across the query terms. Omit domain unless given; none, null, all, and * "
+            "mean no filter. Coverage (how many of the total matches you are seeing) "
+            "is stated in every result."
         ),
         "inputSchema": {
             "type": "object",
@@ -999,8 +1047,9 @@ TOOL_DEFINITIONS = [
             "List the NEWEST entries in the Sovereign Stack chronicle, most recent "
             "first. Use this ONLY for what-happened-recently questions ('what's the "
             "latest?', 'what happened today?'). It takes NO query — for any topical "
-            "or historical question, use stack_recall instead. Read-only. Coverage "
-            "is stated in every result."
+            "or historical question, use stack_recall instead. Omit domain unless "
+            "given; none, null, all, and * mean no filter. Read-only. Coverage is "
+            "stated in every result."
         ),
         "inputSchema": {
             "type": "object",
@@ -1098,8 +1147,7 @@ def call_tool(name: str, arguments: dict) -> str:
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
             raise ValueError("stack_recall requires a non-empty 'query' string")
-        domain = arguments.get("domain")
-        domain = domain.strip() if isinstance(domain, str) and domain.strip() else None
+        domain, domain_note = _normalize_domain(arguments)
         asked = _asked_limit(arguments.get("limit"))
         limit = _clamp_limit(arguments.get("limit"))
         # order is NOT taken from arguments and is NOT in the input schema:
@@ -1108,7 +1156,7 @@ def call_tool(name: str, arguments: dict) -> str:
         if domain:
             forwarded["domain"] = domain
         result = bridge_call("recall_insights", forwarded)
-        return render_recall(result, query.strip(), domain, limit, asked)
+        return render_recall(result, query.strip(), domain, limit, asked, domain_note=domain_note)
 
     if name == "stack_latest":
         # The groove-guard, enforced server-side and not just in the schema: a
@@ -1118,8 +1166,7 @@ def call_tool(name: str, arguments: dict) -> str:
                 "stack_latest takes no 'query' — it returns the newest entries only. "
                 "For a topical search, use stack_recall."
             )
-        domain = arguments.get("domain")
-        domain = domain.strip() if isinstance(domain, str) and domain.strip() else None
+        domain, domain_note = _normalize_domain(arguments)
         asked = _asked_limit(arguments.get("limit"))
         limit = _clamp_limit(arguments.get("limit"))
         # order is pinned to newest and is NOT in the input schema; this door has
@@ -1129,7 +1176,7 @@ def call_tool(name: str, arguments: dict) -> str:
         if domain:
             forwarded["domain"] = domain
         result = bridge_call("recall_insights", forwarded)
-        return render_latest(result, domain, limit, asked)
+        return render_latest(result, domain, limit, asked, domain_note=domain_note)
 
     if name == "stack_open_threads":
         asked = _asked_limit(arguments.get("limit"))
@@ -1195,7 +1242,8 @@ def call_tool(name: str, arguments: dict) -> str:
 
     raise BridgeToolNotAllowed(
         f"refused: '{name}' is not one of this shim's read-only tools "
-        f"({', '.join(sorted(BRIDGE_TARGETS))})."
+        f"({', '.join(sorted(BRIDGE_TARGETS))}). "
+        "This shim is read-only; give the text to HQ for an authorized write."
     )
 
 
