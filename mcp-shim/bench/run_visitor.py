@@ -332,7 +332,8 @@ def response_evidence(response):
     err = result.get("isError", False)
     unavailable = err and body.startswith(("Sovereign Stack unavailable", "Transport refused"))
     outcome = "source-unavailable" if unavailable else "error" if err else "ok"
-    coverage = [line for line in body.splitlines() if "coverage:" in line or line.startswith("scope:")]
+    coverage = [line for line in body.splitlines()
+                if "coverage:" in line or line.startswith(("scope:", "[truncated,"))]
     return outcome, body, coverage, err
 
 
@@ -352,7 +353,7 @@ def run_benchmark(shim, model_call, args, metadata):
         started = time.monotonic()
         row = {"question_number": index + 1, "question": question, "decision_valid": False,
                "route_chosen": "", "args_valid": False, "arguments": None,
-               "source_outcome": "not-dispatched", "failure": "", "evidence_excerpt": "",
+               "source_outcome": "not-dispatched", "failure": "", "evidence_full": "", "evidence_excerpt": "",
                "coverage": [], "semantic_pass": "", "pass_condition": RUBRIC[index],
                "compatibility_ok_err": None, "model_called": False,
                "read_time_utc": None, "cold_warm_state": args.cold_warm,
@@ -372,6 +373,7 @@ def run_benchmark(shim, model_call, args, metadata):
                 name, arguments = validate(json.dumps({"name": name, "arguments": arguments}), contracts)
             row.update(decision_valid=True, args_valid=True, route_chosen=name, arguments=arguments)
             if name == "cannot_write":
+                row["evidence_full"] = REFUSAL
                 row["evidence_excerpt"] = REFUSAL
                 row["coverage"] = ["scope: local refusal; no source call, no write"]
             else:
@@ -379,7 +381,8 @@ def run_benchmark(shim, model_call, args, metadata):
                 response = shim.request({"jsonrpc": "2.0", "id": 100 + index,
                                          "method": "tools/call", "params": {"name": name, "arguments": arguments}})
                 outcome, body, coverage, err = response_evidence(response)
-                row.update(source_outcome=outcome, evidence_excerpt=clip(body), coverage=coverage)
+                row.update(source_outcome=outcome, evidence_full=body,
+                           evidence_excerpt=clip(body), coverage=coverage)
                 row["compatibility_ok_err"] = (err if index == 9 else not err)
                 if "error" in response:
                     row["compatibility_ok_err"] = False  # Original RPC-error exception.
@@ -427,6 +430,7 @@ def markdown(report):
         lines.extend(["", f"## Q{row['question_number']}: {row['question']}", "",
                       f"Failure: {row['failure'] or 'none'}; wall seconds: {row['wall_seconds']:.3f}; "
                       f"model called: {row['model_called']}; cold/warm: {row['cold_warm_state']} (operator-declared).", "",
+                      "Excerpt preview; the JSON row's `evidence_full` holds the full text received for semantic review.", "",
                       *("> " + line for line in row["evidence_excerpt"].splitlines()), "",
                       "Coverage as received:", *("> " + line for line in row["coverage"])])
     return "\n".join(lines) + "\n"

@@ -264,6 +264,23 @@ class TestReport(BenchCase):
         self.assertIn("excerpt clipped", row["evidence_excerpt"])
         self.assertEqual(row["coverage"], ["bridge coverage: returned 1 of 2 matched"])
 
+    def test_full_evidence_and_shim_truncation_survive_excerpt_clipping(self):
+        marker = "[truncated, 1800 of 5000 chars]"
+        coverage = "bridge coverage: returned 1 of 1 matched"
+        body = coverage + "\n" + "fixture evidence " * 100 + "\n" + marker
+        self.shim.response["result"]["content"][0]["text"] = body
+        report = bench.run_benchmark(self.shim, self.model, self.args, {})
+        row = json.loads(json.dumps(report))["rows"][0]
+        self.assertEqual(row["coverage"], [coverage, marker])
+        self.assertEqual(row["evidence_full"], body)
+        self.assertLessEqual(len(row["evidence_excerpt"]), 900)
+        self.assertNotEqual(row["evidence_excerpt"], body)
+        self.assertIn(f"[excerpt clipped; source {len(body)} chars]", row["evidence_excerpt"])
+        self.assertNotIn(marker, row["evidence_excerpt"])
+        text = bench.markdown(report)
+        self.assertIn("Excerpt preview; the JSON row's `evidence_full` holds the full text", text)
+        self.assertIn(marker, text)
+
     def test_source_failure_is_not_empty_success(self):
         self.shim.response = {"result": {"isError": True, "content": [{"type": "text", "text":
             "Sovereign Stack unavailable — fixture outage. No chronicle data was returned."}]}}
